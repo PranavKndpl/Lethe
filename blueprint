@@ -1,0 +1,145 @@
+# 🏛️ Project Lethe: Master Architecture Blueprint
+
+**Version:** 1.0.0
+**Status:** DRAFT / APPROVED
+**Codename:** `Lethe` (The River of Forgetfulness)
+
+---
+
+## 1. Executive Summary
+
+**Project Lethe** is a user-space, distributed, encrypted filesystem designed for **plausible deniability** and **high resilience**. Unlike traditional encrypted containers (e.g., VeraCrypt), Lethe does not store data in a single monolithic file. Instead, it shards data into thousands of fixed-size, encrypted blocks masquerading as high-entropy random noise (e.g., cache files, temp data).
+
+**Core Philosophy:**
+
+1. **Invisibility:** The vault looks like garbage data to forensic tools.
+2. **Resilience:** The system survives corruption of index files or individual blocks.
+3. **Safety:** Zero kernel-mode drivers; purely user-space implementation.
+
+---
+
+## 2. System Architecture
+
+### 2.1 Component Stack
+
+The system is divided into four strictly isolated layers.
+
+| Layer | Component | Responsibility | Tech Stack |
+| --- | --- | --- | --- |
+| **L1** | **Interface** | CLI, Daemon, Mount Point | Python (CLI), C++/Rust (FUSE/WinFsp) |
+| **L2** | **Logic** | Block mapping, Garbage Collection, Journaling | Core Logic |
+| **L3** | **Crypto** | Encryption, Hashing, Key Derivation | XChaCha20-Poly1305, Argon2id, Blake3 |
+| **L4** | **Storage** | Physical I/O, File distribution | Standard OS Filesystem APIs |
+
+### 2.2 The Distributed Storage Model
+
+Instead of `vault.dat`, the storage directory (e.g., `~/.local/share/lethe/store/`) contains:
+
+* **The Swarm:** Thousands of `blk_xxxx.bin` files (default: 64KB).
+* **The Ledger:** Three (3) replica Index files with random names.
+* **The Journal:** A temporary Write-Ahead Log (WAL) for crash recovery.
+
+---
+
+## 3. Data Structures & Formats
+
+### 3.1 The Block (`blk_UUID.bin`)
+
+* **Size:** Fixed (e.g., 64KB). Partial data is padded with random noise.
+* **Content:**
+```text
+[ Nonce (24B) ] || [ Encrypted Compressed Payload (Variable) ] || [ Poly1305 Tag (16B) ]
+
+```
+
+
+* **Naming:** Random UUIDs or hashes. No sequential numbering.
+
+### 3.2 The Index (The Ledger)
+
+* **Format:** **CBOR** (Concise Binary Object Representation).
+* **Redundancy:** 3 separate physical files (Replica A, B, C).
+* **Consensus:** Majority vote on load.
+* **Encryption:** Encrypted entirely with the Master Key.
+* **Schema:**
+```c
+struct Index {
+    u8 magic[4];          // User-specific random marker
+    u64 revision;         // Monotonic counter (for conflict res)
+    u8 salt[32];          // KDF Salt
+    Params crypto_params; // Cipher ID, Block Size, Compression Algo
+    Map<Path, FileNode> file_tree;
+    List<BlockID> free_list; // For Garbage Collection
+}
+
+```
+
+
+
+---
+
+## 4. Functional Requirements (The "Contract")
+
+### 4.1 Security & Crypto
+
+* **REQ-SEC-01:** All data must be encrypted using **XChaCha20-Poly1305**.
+* **REQ-SEC-02:** Key derivation must use **Argon2id** with user-configurable difficulty.
+* **REQ-SEC-03:** Memory containing keys must be protected (locked RAM) and wiped using `explicit_bzero` / `RtlSecureZeroMemory` immediately after use.
+* **REQ-SEC-04:** Nonces must be generated using a deterministic HMAC-based approach or 192-bit CSPRNG to prevent collisions.
+
+### 4.2 Fault Tolerance
+
+* **REQ-FT-01:** The system must use a **Write-Ahead Log (WAL)** for all Index updates. A power cut during a write must strictly effectively revert to the previous state on next boot.
+* **REQ-FT-02:** Critical Metadata (Index) must be stored in **3-way replication**.
+* **REQ-FT-03:** (Optional/Later) Erasure Coding (Reed-Solomon) for data blocks.
+
+### 4.3 Anti-Forensics & Stealth
+
+* **REQ-AF-01:** Dormant state CPU usage must be **0.0%** (blocking waits, no polling).
+* **REQ-AF-02:** No plaintext metadata shall ever touch the disk (filenames, sizes, dates).
+* **REQ-AF-03:** File sizes must be padded to block boundaries to mask content type.
+
+---
+
+## 5. Development Roadmap
+
+### Phase 1: The Core (Foundation)
+
+* **Objective:** Can we encrypt/decrypt blobs and manage a mock index?
+* [ ] Setup Project Structure (Python/C++ hybrid or Pure Rust/C++).
+* [ ] Implement **Crypto Primitives** class (Key derivation, Encrypt/Decrypt block).
+* [ ] Implement **Block Manager** (Write blob  `blk_xyz.bin`).
+
+### Phase 2: The Brain (Index & Journaling)
+
+* **Objective:** Robust metadata management.
+* [ ] Define CBOR Schema.
+* [ ] Implement **Index Manager** with 3-way replication.
+* [ ] Implement **Atomic Transaction** logic (WAL).
+
+### Phase 3: The Ghost (Daemon & FUSE)
+
+* **Objective:** Make it a usable filesystem.
+* [ ] Implement **Daemon** (`lethed`) with OS Hotkey listener.
+* [ ] Implement **FUSE/WinFsp binding**.
+* [ ] Connect FUSE Read/Write ops to Block Manager.
+
+### Phase 4: Production Hardening
+
+* **Objective:** Safety and Cleanup.
+* [ ] Implement **Garbage Collector**.
+* [ ] Memory locking & secure wiping audit.
+* [ ] Performance tuning (Caching layer).
+
+---
+
+## 6. Usage Workflow (User Story)
+
+1. **Install:** `pip install lethe-fs` (or binary download).
+2. **Init:** `lethe init --location ~/.cache/nvidia/update_store` (Disguised path).
+3. **Daemon:** System starts `lethed` in background (silent).
+4. **Trigger:** User hits `Ctrl + Alt + ]`.
+5. **Auth:** Secure prompt appears. User types password.
+6. **Mount:** `Z:\` appears containing their secret files.
+7. **Work:** User edits files. Blocks update seamlessly in background.
+8. **Vanish:** User hits `Ctrl + Alt + ]` again. `Z:\` unmounts. RAM is wiped.
