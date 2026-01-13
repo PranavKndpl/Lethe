@@ -7,6 +7,7 @@ edition = "2024"
 lethe_core = { path = "../lethe_core" }
 anyhow = "1.0"
 rdev = "0.5" # Global hotkey listener (Cross-platform)
+widestring = "1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.14" # Linux FUSE bindings
@@ -14,4 +15,8 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winfsp = "0.10" # Windows FUSE bindings (requires WinFsp installed)
-windows = { version = "0.52", features = ["Win32_System_Threading"] }
+windows = { version = "0.52", features = [
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem", # for FILE_ATTRIBUTE_*
+    "Win32_Foundation"
+] }

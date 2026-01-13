@@ -620,6 +620,7 @@ dependencies = [
  "lethe_core",
  "libc",
  "rdev",
+ "widestring",
  "windows",
  "winfsp",
 ]
