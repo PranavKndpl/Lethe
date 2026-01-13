@@ -4,3 +4,4 @@ members = [
     "lethe_cli",
     "lethe_daemon",
 ]
+resolver = "2"
