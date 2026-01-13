@@ -1,5 +1,5 @@
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce
 };
 use argon2::{
@@ -20,23 +20,23 @@ pub struct MasterKey {
 }
 
 impl MasterKey {
-    // Create a new MasterKey from raw bytes
+    /// Create a new MasterKey from raw bytes
     pub fn new(bytes: [u8; KEY_SIZE]) -> Self {
         Self { key: bytes }
     }
     
-    // Get reference to the raw bytes (use carefully)
+    /// Get reference to the raw bytes (use carefully)
     pub fn as_bytes(&self) -> &[u8; KEY_SIZE] {
         &self.key
     }
 }
 
-// The main Crypto Engine handling encryption/decryption logic
+/// The main Crypto Engine handling encryption/decryption logic
 pub struct CryptoEngine;
 
 impl CryptoEngine {
-    // Derives a MasterKey from a password using Argon2id.
-    // Returns the Key and the Salt (salt must be stored in the index).
+    /// Derives a MasterKey from a password using Argon2id.
+    /// Returns the Key and the Salt (salt must be stored in the index).
     pub fn derive_key(password: &str) -> Result<(MasterKey, String)> {
         let salt = SaltString::generate(&mut OsRng);
         
@@ -68,8 +68,8 @@ impl CryptoEngine {
         Ok((MasterKey::new(key_bytes), salt.as_str().to_string()))
     }
 
-    // Encrypts a chunk of data.
-    // Returns: (Ciphertext, Nonce)
+    /// Encrypts a chunk of data.
+    /// Returns: (Ciphertext, Nonce)
     pub fn encrypt(data: &[u8], key: &MasterKey) -> Result<(Vec<u8>, Vec<u8>)> {
         let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
         
@@ -85,7 +85,7 @@ impl CryptoEngine {
         Ok((ciphertext, nonce_bytes.to_vec()))
     }
 
-    // Decrypts a chunk of data.
+    /// Decrypts a chunk of data.
     pub fn decrypt(ciphertext: &[u8], nonce: &[u8], key: &MasterKey) -> Result<Vec<u8>> {
         if nonce.len() != NONCE_SIZE {
             return Err(anyhow::anyhow!("Invalid nonce length"));

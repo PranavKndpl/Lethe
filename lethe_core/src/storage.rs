@@ -5,13 +5,13 @@ use uuid::Uuid;
 use anyhow::{Result, Context};
 use crate::crypto::{CryptoEngine, MasterKey};
 
-// Manages the physical storage of encrypted blocks on disk.
+/// Manages the physical storage of encrypted blocks on disk.
 pub struct BlockManager {
     root_path: PathBuf,
 }
 
 impl BlockManager {
-    // Initialize the manager pointing to a specific directory
+    /// Initialize the manager pointing to a specific directory
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         
@@ -24,8 +24,8 @@ impl BlockManager {
         Ok(Self { root_path })
     }
 
-    // Takes raw data, compresses it, encrypts it, and saves it to disk.
-    // Returns the UUID of the new block.
+    /// Takes raw data, compresses it, encrypts it, and saves it to disk.
+    /// Returns the UUID of the new block.
     pub fn write_block(&self, data: &[u8], key: &MasterKey) -> Result<String> {
         // 1. Compress (Zstd)
         // Level 3 is a good balance of speed vs ratio
@@ -51,7 +51,7 @@ impl BlockManager {
         Ok(block_id)
     }
 
-    // Reads a block ID, reads disk, decrypts, and decompresses.
+    /// Reads a block ID, reads disk, decrypts, and decompresses.
     pub fn read_block(&self, block_id: &str, key: &MasterKey) -> Result<Vec<u8>> {
         let file_path = self.root_path.join(format!("blk_{}.bin", block_id));
         
@@ -79,7 +79,7 @@ impl BlockManager {
         Ok(original_data)
     }
 
-    // Deletes a block permanently
+    /// Deletes a block permanently
     pub fn delete_block(&self, block_id: &str) -> Result<()> {
         let file_path = self.root_path.join(format!("blk_{}.bin", block_id));
         if file_path.exists() {
