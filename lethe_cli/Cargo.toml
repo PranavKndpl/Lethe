@@ -8,3 +8,15 @@ lethe_core = { path = "../lethe_core" }
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 rpassword = "7.0"
+walkdir = "2.4"
+libc = "0.2"             # Required for FUSE errors
+log = "0.4"
+env_logger = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+fuser = "0.14" 
+fxhash = "0.2"           # Required for stable file IDs
+dirs = "5.0"
+dialoguer = "0.10"
+console = "0.15"
+daemonize = "0.5"
