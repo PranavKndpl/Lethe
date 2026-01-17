@@ -14,6 +14,9 @@ pub struct FileEntry {
     pub size: u64,          
     pub modified: u64,      // Unix timestamp
     pub blocks: Vec<String>,// List of UUIDs: ["uuid1", "uuid2"]
+
+    #[serde(default)] 
+    pub is_dir: bool,
 }
 
 /// The entire "Database" of the filesystem
@@ -139,6 +142,18 @@ impl IndexManager {
             size,
             modified: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             blocks,
+            is_dir: false,
+        };
+        self.data.files.insert(path, entry);
+    }
+
+    pub fn add_dir(&mut self, path: String) {
+        let entry = FileEntry {
+            path: path.clone(),
+            size: 0,
+            modified: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            blocks: vec![],
+            is_dir: true,
         };
         self.data.files.insert(path, entry);
     }

@@ -4,24 +4,31 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# --- Internal Logic ---
 lethe_core = { path = "../lethe_core" }
-clap = { version = "4.4", features = ["derive"] }
-anyhow = "1.0"
-rpassword = "7.0"
-walkdir = "2.4"
-dirs = "5.0"
-log = "0.4"
-env_logger = "0.10"
-fxhash = "0.2"
 
-# --- WEBDAV STACK ---
-# The logic for WebDAV
+# --- CLI Utilities ---
+clap = { version = "4.4", features = ["derive"] } # Command line argument parsing
+anyhow = "1.0"      # Error handling
+rpassword = "7.0"   # Secure password prompting (masks input)
+walkdir = "2.4"     # Recursive directory walking (for 'lethe put')
+dirs = "5.0"        # Finding home directories cross-platform
+log = "0.4"         # Logging facade
+env_logger = "0.10" # Logger implementation
+fxhash = "0.2"      # Fast hashing for in-memory maps
+humansize = "2.1"
+
+# --- WebDAV Server Stack (The new "Driver") ---
+# The core WebDAV logic that handles LS, MKDIR, PUT, GET
 dav-server = { version = "0.5", features = ["warp-compat"] }
-# The actual HTTP server
+
+# The HTTP server that powers the WebDAV drive
 warp = "0.3"
-# Async runtime
+
+# Async runtime required for the server
 tokio = { version = "1", features = ["full"] }
-# Data types
+
+# HTTP/Network utilities
 headers = "0.3"
 bytes = "1"
 futures-util = "0.3"

@@ -4,13 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# --- Serialization (Saving the Index) ---
 serde = { version = "1.0", features = ["derive"] }
-serde_cbor = "0.11"
-chacha20poly1305 = "0.10"
-argon2 = "0.5"
+serde_cbor = "0.11" # Binary format for index files (smaller/faster than JSON)
+
+# --- Cryptography (The Security Layer) ---
+# XChaCha20-Poly1305: Authenticated Encryption (better than AES-GCM for this)
+chacha20poly1305 = "0.10" 
+
+# Argon2: State-of-the-art password hashing for deriving the MasterKey
+argon2 = "0.5" 
+
+# Randomness for salts and nonces
 rand = "0.8"
+
+# Clears memory on drop (prevents password from staying in RAM)
 zeroize = { version = "1.7", features = ["derive"] }
+
+# --- Compression ---
+# Zstandard: High compression ratio, very fast decompression
 zstd = "0.13"
-uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# --- Utilities ---
+uuid = { version = "1.6", features = ["v4", "serde"] } # For block IDs
 anyhow = "1.0"
 thiserror = "1.0"
