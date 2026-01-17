@@ -6,6 +6,7 @@ use anyhow::{Result, Context};
 use crate::crypto::{CryptoEngine, MasterKey};
 
 /// Manages the physical storage of encrypted blocks on disk.
+#[derive(Debug)]
 pub struct BlockManager {
     root_path: PathBuf,
 }

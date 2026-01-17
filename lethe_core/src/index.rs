@@ -37,6 +37,7 @@ impl VaultIndex {
 }
 
 /// Manages the loading, saving, and syncing of the Index
+#[derive(Debug)]
 pub struct IndexManager {
     root_path: PathBuf,
     pub data: VaultIndex,

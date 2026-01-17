@@ -13,7 +13,7 @@ use anyhow::{Result, Context};
 const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 24;
 
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop, Debug)]
 pub struct MasterKey {
     key: [u8; KEY_SIZE],
 }

@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "lethe_core",
+    "lethe_cli",
+]
+resolver = "2"
