@@ -1,0 +1,1553 @@
+STRUCTURE
+
+LETHE/
+├── lethe_cli/
+│   ├── src/
+│   │   ├── fs_fuse.rs
+│   │   ├── fs_webdav.rs
+│   │   └── main.rs
+│   └── Cargo.toml
+│
+├── lethe_core/
+│   ├── src/
+│   │   ├── config.rs
+│   │   ├── crypto.rs
+│   │   ├── index.rs
+│   │   ├── storage.rs
+│   │   └── lib.rs
+│   └── Cargo.toml
+│
+├── my_vault/
+├── target/
+├── .gitignore
+├── Cargo.toml
+├── Cargo.lock
+
+
+
+
+
+CODE:
+
+
+
+*Cargo.toml*
+```
+[workspace]
+members = [
+    "lethe_core",
+    "lethe_cli",
+]
+resolver = "2"
+
+```
+
+*lethe_cli\Cargo.toml*
+```
+[package]
+name = "lethe_cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# --- Internal Logic ---
+lethe_core = { path = "../lethe_core" }
+
+# --- CLI Utilities ---
+clap = { version = "4.4", features = ["derive"] } # Command line argument parsing
+anyhow = "1.0"      # Error handling
+rpassword = "7.0"   # Secure password prompting (masks input)
+walkdir = "2.4"     # Recursive directory walking (for 'lethe put')
+dirs = "5.0"        # Finding home directories cross-platform
+log = "0.4"         # Logging facade
+env_logger = "0.10" # Logger implementation
+fxhash = "0.2"      # Fast hashing for in-memory maps
+humansize = "2.1"
+
+# --- WebDAV Server Stack (The new "Driver") ---
+# The core WebDAV logic that handles LS, MKDIR, PUT, GET
+dav-server = { version = "0.5", features = ["warp-compat"] }
+
+# The HTTP server that powers the WebDAV drive
+warp = "0.3"
+
+# Async runtime required for the server
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/Network utilities
+headers = "0.3"
+bytes = "1"
+futures-util = "0.3"
+httparse = "1.8"
+```
+
+*lethe_cli\src\fs_fuse.rs*
+```
+use fuser::{
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyWrite, ReplyCreate, ReplyEmpty, Request, TimeOrNow,
+};
+use std::ffi::OsStr;
+use std::time::{Duration, UNIX_EPOCH, SystemTime};
+use std::collections::{HashMap, HashSet};
+use lethe_core::index::IndexManager;
+use lethe_core::storage::BlockManager;
+use lethe_core::crypto::MasterKey;
+
+// --- CROSS PLATFORM ERROR CODES ---
+#[cfg(unix)]
+use libc::{ENOENT, EACCES, ENOTEMPTY};
+
+#[cfg(windows)]
+const ENOENT: i32 = 2;
+#[cfg(windows)]
+const EACCES: i32 = 13;
+#[cfg(windows)]
+const ENOTEMPTY: i32 = 39; 
+
+const TTL: Duration = Duration::from_secs(1);
+
+pub struct LetheFS {
+    pub index: IndexManager,
+    pub storage: BlockManager,
+    pub key: MasterKey,
+    pub inode_map: HashMap<u64, String>,
+    pub write_buffer: HashMap<u64, Vec<u8>>,
+}
+
+impl LetheFS {
+    // --- HELPER 1: Resolve Path Logic ---
+    // Turns (parent_ino, "filename") -> "/path/to/filename"
+    fn resolve_path(&self, parent_ino: u64, name: &OsStr) -> Option<String> {
+        let parent_path = self.inode_map.get(&parent_ino)?;
+        let name_str = name.to_string_lossy();
+        
+        Some(if parent_path == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path, name_str)
+        })
+    }
+
+    // --- HELPER 2: Generate File Attributes ---
+    fn get_file_attr(&self, path: &str, ino: u64) -> FileAttr {
+        // 1. Root Directory
+        if path == "/" {
+            return self.attr_dir(ino);
+        }
+
+        // 2. Regular File (In Index)
+        if let Some(entry) = self.index.get_file(path) {
+            return self.attr_file(ino, entry.size);
+        }
+
+        // 3. Regular File (In Write Buffer)
+        if let Some(buffer) = self.write_buffer.get(&ino) {
+            return self.attr_file(ino, buffer.len() as u64);
+        }
+
+        // 4. Implicit Directory (Not in index, but has entry in map)
+        // (If logic reached here, it's a directory)
+        self.attr_dir(ino)
+    }
+
+    fn attr_dir(&self, ino: u64) -> FileAttr {
+        FileAttr {
+            ino, size: 0, blocks: 0,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
+            kind: FileType::Directory, perm: 0o755, nlink: 2, 
+            uid: 1000, gid: 1000, rdev: 0, flags: 0, blksize: 512,
+        }
+    }
+
+    fn attr_file(&self, ino: u64, size: u64) -> FileAttr {
+        FileAttr {
+            ino, size, blocks: 1,
+            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH, crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile, perm: 0o644, nlink: 1,
+            uid: 1000, gid: 1000, rdev: 0, flags: 0, blksize: 512,
+        }
+    }
+}
+
+impl Filesystem for LetheFS {
+    // 1. LOOKUP
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if let Some(path) = self.resolve_path(parent, name) {
+            let ino = fxhash::hash64(&path);
+            
+            // If it exists in map OR buffer, return it
+            if self.inode_map.contains_key(&ino) || self.write_buffer.contains_key(&ino) {
+                self.inode_map.insert(ino, path.clone()); // Ensure map has it
+                reply.entry(&TTL, &self.get_file_attr(&path, ino), 0);
+                return;
+            }
+        }
+        reply.error(ENOENT);
+    }
+
+    // 2. GET ATTR
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        if let Some(path) = self.inode_map.get(&ino).cloned() {
+            reply.attr(&TTL, &self.get_file_attr(&path, ino));
+        } else if ino == 1 {
+            reply.attr(&TTL, &self.get_file_attr("/", 1));
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 3. SET ATTR
+    fn setattr(
+        &mut self, _req: &Request, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>,
+        size: Option<u64>, _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>,
+        _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>, reply: ReplyAttr,
+    ) {
+        if let Some(path) = self.inode_map.get(&ino).cloned() {
+            if let Some(new_size) = size {
+                 if let Some(buffer) = self.write_buffer.get_mut(&ino) {
+                     buffer.resize(new_size as usize, 0);
+                 }
+            }
+            reply.attr(&TTL, &self.get_file_attr(&path, ino));
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 4. READ DIR
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        let dir_path = match self.inode_map.get(&ino) {
+            Some(p) => p.clone(),
+            None => { reply.error(ENOENT); return; }
+        };
+
+        let mut entries = vec![
+            (ino, FileType::Directory, ".".to_string()),
+            (ino, FileType::Directory, "..".to_string()),
+        ];
+
+        let mut seen = HashSet::new();
+
+        for (child_ino, child_path) in &self.inode_map {
+            // Check if child_path is direct child of dir_path
+            let is_child = if dir_path == "/" {
+                child_path.starts_with('/') && child_path.matches('/').count() == 1
+            } else {
+                child_path.starts_with(&dir_path) && 
+                child_path.len() > dir_path.len() &&
+                child_path.chars().nth(dir_path.len()) == Some('/') && 
+                child_path[dir_path.len()+1..].matches('/').count() == 0 
+            };
+
+            if is_child {
+                let name = if dir_path == "/" {
+                    child_path.trim_start_matches('/').to_string()
+                } else {
+                    child_path.strip_prefix(&format!("{}/", dir_path)).unwrap_or("").to_string()
+                };
+
+                if !name.is_empty() && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    let kind = if self.index.data.files.contains_key(child_path) {
+                        FileType::RegularFile
+                    } else {
+                        FileType::Directory
+                    };
+                    entries.push((*child_ino, kind, name));
+                }
+            }
+        }
+
+        for (i, (inode, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(inode, (i + 1) as i64, kind, name) { break; }
+        }
+        reply.ok();
+    }
+
+    // 5. CREATE
+    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+        if let Some(path) = self.resolve_path(parent, name) {
+            let ino = fxhash::hash64(&path);
+            self.inode_map.insert(ino, path.clone());
+            self.write_buffer.insert(ino, Vec::new());
+            reply.created(&TTL, &self.get_file_attr(&path, ino), 0, 0, 0);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 6. WRITE
+    fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _wflags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
+        if let Some(buffer) = self.write_buffer.get_mut(&ino) {
+            let end = offset as usize + data.len();
+            if end > buffer.len() { buffer.resize(end, 0); }
+            buffer[offset as usize..end].copy_from_slice(data);
+            reply.written(data.len() as u32);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 7. READ
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+        // Read from RAM Buffer
+        if let Some(buffer) = self.write_buffer.get(&ino) {
+             let end = std::cmp::min((offset as u64 + size as u64) as usize, buffer.len());
+             if offset as usize >= buffer.len() { reply.data(&[]); } 
+             else { reply.data(&buffer[offset as usize..end]); }
+             return;
+        }
+        
+        // Read from Disk
+        if let Some(path) = self.inode_map.get(&ino) {
+             if let Some(entry) = self.index.get_file(path) {
+                let mut full_data = Vec::new();
+                for block_id in &entry.blocks {
+                    if let Ok(mut chunk) = self.storage.read_block(block_id, &self.key) {
+                        full_data.append(&mut chunk);
+                    }
+                }
+                let end = std::cmp::min((offset as u64 + size as u64) as usize, full_data.len());
+                if offset as usize >= full_data.len() { reply.data(&[]); } 
+                else { reply.data(&full_data[offset as usize..end]); }
+             } else {
+                 reply.error(ENOENT);
+             }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 8. RELEASE
+    fn release(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
+        if let Some(data) = self.write_buffer.remove(&ino) {
+            if let Some(path) = self.inode_map.get(&ino).cloned() {
+                if let Ok(block_id) = self.storage.write_block(&data, &self.key) {
+                    self.index.add_file(path.clone(), vec![block_id], data.len() as u64);
+                    let _ = self.index.save(&self.key);
+                }
+            }
+        }
+        reply.ok();
+    }
+
+    // 9. UNLINK
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(path) = self.resolve_path(parent, name) {
+            if self.index.data.files.remove(&path).is_some() {
+                let ino = fxhash::hash64(&path);
+                self.inode_map.remove(&ino);
+                self.write_buffer.remove(&ino);
+                let _ = self.index.save(&self.key);
+                reply.ok();
+            } else {
+                reply.error(ENOENT);
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 10. RMDIR
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(dir_path) = self.resolve_path(parent, name) {
+            let is_empty = !self.index.data.files.keys().any(|k| {
+                 k.starts_with(&dir_path) && k.len() > dir_path.len() && k.chars().nth(dir_path.len()) == Some('/')
+            });
+
+            if is_empty {
+                let ino = fxhash::hash64(&dir_path);
+                self.inode_map.remove(&ino);
+                reply.ok();
+            } else {
+                reply.error(ENOTEMPTY); 
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 11. RENAME
+    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+        let old_path_opt = self.resolve_path(parent, name);
+        let new_path_opt = self.resolve_path(newparent, newname);
+
+        if let (Some(old_path), Some(new_path)) = (old_path_opt, new_path_opt) {
+            if let Some(entry) = self.index.data.files.remove(&old_path) {
+                self.index.data.files.insert(new_path.clone(), entry);
+                
+                let old_ino = fxhash::hash64(&old_path);
+                let new_ino = fxhash::hash64(&new_path);
+                self.inode_map.remove(&old_ino);
+                self.inode_map.insert(new_ino, new_path);
+
+                let _ = self.index.save(&self.key);
+                reply.ok();
+            } else {
+                reply.error(ENOENT);
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+}
+```
+
+*lethe_cli\src\fs_webdav.rs*
+```
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use tokio::sync::Mutex;
+use dav_server::fs::{DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsFuture, FsError, FsResult, ReadDirMeta, OpenOptions};
+use dav_server::davpath::DavPath;
+use lethe_core::index::IndexManager;
+use lethe_core::storage::BlockManager;
+use lethe_core::crypto::MasterKey;
+use bytes::Buf;
+
+// --- 0. CONCRETE METADATA STRUCT ---
+#[derive(Debug, Clone)]
+pub struct LetheMetaData {
+    len: u64,
+    modified: SystemTime,
+    is_dir: bool,
+    etag: String,
+}
+
+impl DavMetaData for LetheMetaData {
+    fn len(&self) -> u64 { self.len }
+    fn modified(&self) -> FsResult<SystemTime> { Ok(self.modified) }
+    fn is_dir(&self) -> bool { self.is_dir }
+    fn etag(&self) -> Option<String> { Some(self.etag.clone()) }
+}
+
+// --- 1. THE FILE HANDLE ---
+#[derive(Debug)]
+pub struct LetheDavFile {
+    buffer: Cursor<Vec<u8>>, 
+    path: String,
+    fs: LetheWebDav, 
+}
+
+impl DavFile for LetheDavFile {
+    fn read_bytes(&mut self, count: usize) -> FsFuture<bytes::Bytes> {
+        let mut buf = vec![0u8; count];
+        match self.buffer.read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Box::pin(async move { Ok(bytes::Bytes::from(buf)) })
+            }
+            Err(_) => Box::pin(async { Err(FsError::GeneralFailure) }),
+        }
+    }
+
+    fn write_buf(&mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<()> {
+        let mut chunk = vec![0u8; buf.remaining()];
+        buf.copy_to_slice(&mut chunk);
+        match self.buffer.write_all(&chunk) {
+            Ok(_) => Box::pin(async { Ok(()) }),
+            Err(_) => Box::pin(async { Err(FsError::GeneralFailure) }),
+        }
+    }
+
+    fn write_bytes(&mut self, buf: bytes::Bytes) -> FsFuture<()> {
+        self.write_buf(Box::new(buf))
+    }
+
+    fn metadata(&mut self) -> FsFuture<Box<dyn DavMetaData>> {
+        let len = self.buffer.get_ref().len() as u64;
+        // In-memory files are considered "new" until flushed, but we give them a specific tag
+        // to avoid confusion if they are read before flush.
+        let modified = SystemTime::now(); 
+        let etag = format!("\"mem-{:x}\"", len); 
+
+        Box::pin(async move {
+            Ok(Box::new(LetheMetaData {
+                len,
+                modified,
+                is_dir: false,
+                etag,
+            }) as Box<dyn DavMetaData>)
+        })
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> FsFuture<u64> {
+        let res = self.buffer.seek(pos).map_err(|_| FsError::GeneralFailure);
+        Box::pin(async move { res })
+    }
+
+    fn flush(&mut self) -> FsFuture<()> {
+        let path = self.path.clone();
+        let data = self.buffer.get_ref().clone();
+        let index_arc = self.fs.index.clone();
+        let storage_arc = self.fs.storage.clone();
+        let key_arc = self.fs.key.clone();
+
+        Box::pin(async move {
+            let mut index = index_arc.lock().await;
+            if let Ok(block_id) = storage_arc.write_block(&data, &key_arc) {
+                // When we save, we rely on IndexManager to set the 'modified' time
+                index.add_file(path, vec![block_id], data.len() as u64);
+                let _ = index.save(&key_arc);
+                Ok(())
+            } else {
+                Err(FsError::GeneralFailure)
+            }
+        })
+    }
+}
+
+// --- 2. THE FILESYSTEM ---
+#[derive(Debug, Clone)]
+pub struct LetheWebDav {
+    pub index: Arc<Mutex<IndexManager>>,
+    pub storage: Arc<BlockManager>,
+    pub key: Arc<MasterKey>,
+}
+
+impl DavFileSystem for LetheWebDav {
+    fn open<'a>(&'a self, path: &'a DavPath, _options: OpenOptions) -> FsFuture<Box<dyn DavFile>> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let fs_clone = self.clone();
+        let index_arc = self.index.clone();
+        let storage_arc = self.storage.clone();
+        let key_arc = self.key.clone();
+
+        Box::pin(async move {
+            let index = index_arc.lock().await;
+            let mut data = Vec::new();
+            
+            // If it's a directory, return error immediately
+            if let Some(entry) = index.get_file(&path_str) {
+                if entry.is_dir { return Err(FsError::Forbidden); }
+                
+                for block_id in &entry.blocks {
+                    if let Ok(mut chunk) = storage_arc.read_block(block_id, &key_arc) {
+                        data.append(&mut chunk);
+                    }
+                }
+            }
+
+            Ok(Box::new(LetheDavFile {
+                buffer: Cursor::new(data),
+                path: path_str,
+                fs: fs_clone,
+            }) as Box<dyn DavFile>)
+        })
+    }
+
+    fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: ReadDirMeta) -> FsFuture<dav_server::fs::FsStream<Box<dyn DavDirEntry>>> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let index_arc = self.index.clone();
+
+        Box::pin(async move {
+            let index = index_arc.lock().await;
+            let mut entries = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+
+            for full_path in index.data.files.keys() {
+                if let Some(rest) = full_path.strip_prefix(&path_str) {
+                    let clean_rest = rest.trim_start_matches('/');
+                    if clean_rest.is_empty() { continue; }
+                    
+                    let name = clean_rest.split('/').next().unwrap_or("");
+                    if !name.is_empty() && !seen.contains(name) {
+                        seen.insert(name.to_string());
+                        
+                        let is_exact_match = full_path == &format!("{}/{}", path_str.trim_end_matches('/'), name) 
+                                          || full_path == &format!("/{}", name);
+                        
+                        let meta = if is_exact_match {
+                            if let Some(e) = index.get_file(full_path) {
+                                LetheMetaData {
+                                    len: e.size,
+                                    modified: UNIX_EPOCH + std::time::Duration::from_secs(e.modified),
+                                    is_dir: e.is_dir,
+                                    // STABLE ETAG: Hash of size + modification time
+                                    etag: format!("\"{:x}-{:x}\"", e.size, e.modified),
+                                }
+                            } else {
+                                // Fallback (should not happen)
+                                LetheMetaData { len: 0, modified: UNIX_EPOCH, is_dir: false, etag: "\"0\"".to_string() }
+                            }
+                        } else {
+                            // IMPLICIT DIRECTORY
+                            // CRITICAL FIX: Use stable time (EPOCH) and stable ETag (Hash of name)
+                            LetheMetaData { 
+                                len: 0, 
+                                modified: UNIX_EPOCH, // Always 1970. Stable.
+                                is_dir: true,
+                                etag: format!("\"dir-{}\"", fxhash::hash64(name)), // Stable ETag
+                            }
+                        };
+
+                        entries.push(Box::new(LetheDavEntry {
+                            name: name.to_string(),
+                            meta,
+                        }) as Box<dyn DavDirEntry>);
+                    }
+                }
+            }
+            
+            let stream = futures_util::stream::iter(entries);
+            Ok(Box::pin(stream) as dav_server::fs::FsStream<Box<dyn DavDirEntry>>)
+        })
+    }
+
+    fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<Box<dyn DavMetaData>> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let index_arc = self.index.clone();
+
+        Box::pin(async move {
+            let index = index_arc.lock().await;
+
+            if path_str == "/" {
+                return Ok(Box::new(LetheMetaData {
+                    len: 0, 
+                    modified: UNIX_EPOCH, // Root is always 1970
+                    is_dir: true,
+                    etag: "\"root\"".to_string(),
+                }) as Box<dyn DavMetaData>);
+            }
+
+            if let Some(entry) = index.get_file(&path_str) {
+                return Ok(Box::new(LetheMetaData {
+                    len: entry.size,
+                    modified: UNIX_EPOCH + std::time::Duration::from_secs(entry.modified),
+                    is_dir: entry.is_dir,
+                    // STABLE ETAG
+                    etag: format!("\"{:x}-{:x}\"", entry.size, entry.modified),
+                }) as Box<dyn DavMetaData>);
+            }
+
+            // Check implicit directories
+            let is_dir = index.data.files.keys().any(|k: &String| k.starts_with(&format!("{}/", path_str)));
+            if is_dir {
+                return Ok(Box::new(LetheMetaData {
+                    len: 0,
+                    modified: UNIX_EPOCH, // Implicit dirs are always 1970
+                    is_dir: true,
+                    // STABLE ETAG based on path hash
+                    etag: format!("\"implicit-{}\"", fxhash::hash64(&path_str)),
+                }) as Box<dyn DavMetaData>);
+            }
+
+            Err(FsError::NotFound)
+        })
+    }
+
+    // --- WRITE OPS --- (Keep these as they were, they are safe)
+    fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let index_arc = self.index.clone();
+        let key_arc = self.key.clone();
+
+        Box::pin(async move {
+            let mut index = index_arc.lock().await;
+            if index.get_file(&path_str).is_some() { return Err(FsError::Exists); }
+            index.add_dir(path_str);
+            let _ = index.save(&key_arc);
+            Ok(())
+        })
+    }
+
+    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let index_arc = self.index.clone();
+        let key_arc = self.key.clone();
+
+        Box::pin(async move {
+            let mut index = index_arc.lock().await;
+            let has_children = index.data.files.keys().any(|k| k.starts_with(&format!("{}/", path_str)));
+            if has_children { return Err(FsError::Forbidden); }
+            if index.data.files.remove(&path_str).is_some() {
+                let _ = index.save(&key_arc);
+                Ok(())
+            } else {
+                Err(FsError::NotFound)
+            }
+        })
+    }
+
+    fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let index_arc = self.index.clone();
+        let key_arc = self.key.clone();
+        Box::pin(async move {
+            let mut index = index_arc.lock().await;
+            if index.data.files.remove(&path_str).is_some() {
+                let _ = index.save(&key_arc);
+                Ok(())
+            } else {
+                Err(FsError::NotFound)
+            }
+        })
+    }
+
+    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<()> {
+        let old_path = from.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let new_path = to.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let index_arc = self.index.clone();
+        let key_arc = self.key.clone();
+        Box::pin(async move {
+            let mut index = index_arc.lock().await;
+            let mut to_move = Vec::new();
+            if index.data.files.contains_key(&old_path) { to_move.push(old_path.clone()); }
+            for k in index.data.files.keys() {
+                if k.starts_with(&format!("{}/", old_path)) { to_move.push(k.clone()); }
+            }
+            if to_move.is_empty() { return Err(FsError::NotFound); }
+            for src in to_move {
+                if let Some(mut entry) = index.data.files.remove(&src) {
+                    let suffix = src.strip_prefix(&old_path).unwrap_or("");
+                    let dest = format!("{}{}", new_path, suffix);
+                    entry.path = dest.clone();
+                    index.data.files.insert(dest, entry);
+                }
+            }
+            let _ = index.save(&key_arc);
+            Ok(())
+        })
+    }
+}
+
+pub struct LetheDavEntry { name: String, meta: LetheMetaData }
+impl DavDirEntry for LetheDavEntry {
+    fn name(&self) -> Vec<u8> { self.name.as_bytes().to_vec() }
+    fn metadata(&self) -> FsFuture<Box<dyn DavMetaData>> {
+        let m = self.meta.clone();
+        Box::pin(async move { Ok(Box::new(m) as Box<dyn DavMetaData>) })
+    }
+}
+```
+
+*lethe_cli\src\main.rs*
+```
+use clap::{Parser, Subcommand};
+use anyhow::{Result, Context, anyhow};
+use std::path::{Path, PathBuf};
+use std::fs;
+use std::process::Command;
+use std::sync::Arc;
+use std::io::{self, Write};
+use walkdir::WalkDir;
+use log::{info, error, warn};
+
+use lethe_core::crypto::{CryptoEngine, MasterKey};
+use lethe_core::storage::BlockManager;
+use lethe_core::index::IndexManager;
+
+mod fs_webdav;
+
+#[derive(Parser)]
+#[command(name = "lethe", about = "A serverless, encrypted, distributed filesystem.", version = "1.0.0")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize a new vault
+    Init { 
+        #[arg(short, long)] 
+        path: Option<String> 
+    },
+    /// Encrypt and upload a file or directory
+    Put { 
+        #[arg(short, long)] 
+        file: PathBuf, 
+        #[arg(short, long)] 
+        dest: String, 
+        #[arg(long)] 
+        vault: String 
+    },
+    /// List files in the vault
+    Ls { 
+        #[arg(long)] 
+        vault: String 
+    },
+    /// Decrypt and retrieve a file
+    Get { 
+        #[arg(short, long)] 
+        src: String, 
+        #[arg(short, long)] 
+        out: PathBuf, 
+        #[arg(long)] 
+        vault: String 
+    },
+    /// Mount the vault as a virtual drive
+    Mount { 
+        /// Optional: Vault path (Default: ~/.lethe_vault)
+        #[arg(long)] 
+        vault: Option<String>, 
+        /// Windows: Drive Letter (e.g., "Z:"). Linux: Ignored (uses auto-mount).
+        #[arg(long)] 
+        mountpoint: Option<String> 
+    },
+    /// Attempt to repair index consistency
+    Repair { 
+        #[arg(long)] 
+        vault: String 
+    },
+    /// Emergency cleanup of mount points
+    Panic,
+}
+
+// --- SAFETY GUARD FOR WINDOWS MOUNTS ---
+// This ensures that even if the app crashes or panics, the drive is unmounted.
+#[cfg(target_os = "windows")]
+struct MountGuard {
+    drive: String,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        println!("🧹 Cleaning up drive {}...", self.drive);
+        let _ = Command::new("net")
+            .args(&["use", &self.drive, "/delete", "/y"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+// MAIN ENTRY POINT
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging (Run with RUST_LOG=info to see logs)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    
+    let cli = Cli::parse();
+
+    match &cli.command {
+        // --- 1. INIT ---
+        Commands::Init { path } => {
+            let vault_path = resolve_vault_path(path.as_deref())?;
+            if vault_path.exists() { 
+                anyhow::bail!("Vault already exists at {:?}", vault_path); 
+            }
+
+            println!("🛡️  Initializing vault at: {:?}", vault_path);
+            let password = rpassword::prompt_password("Set Master Password: ")?;
+            let confirm = rpassword::prompt_password("Confirm Password: ")?;
+
+            if password != confirm { anyhow::bail!("Passwords do not match."); }
+            if password.is_empty() { anyhow::bail!("Password cannot be empty."); }
+
+            fs::create_dir_all(&vault_path).context("Failed to create vault directory")?;
+
+            println!("🔑 Generating keys (Argon2id)...");
+            // Run CPU-intensive crypto on a blocking thread
+            let (key, salt) = tokio::task::block_in_place(|| CryptoEngine::derive_key(&password))?;
+
+            fs::write(vault_path.join("salt.loader"), &salt).context("Failed to write salt")?;
+
+            let mut index_mgr = IndexManager::new_empty(vault_path.clone(), salt);
+            index_mgr.save(&key)?;
+
+            let _ = BlockManager::new(&vault_path)?;
+            println!("✅ Vault initialized successfully.");
+        }
+
+        // --- 2. PUT ---
+        Commands::Put { file, dest, vault } => {
+            let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(vault))?;
+            let mut index_mgr = IndexManager::load(vault_path.clone(), &key)?;
+            let block_mgr = BlockManager::new(&vault_path)?;
+
+            if !file.exists() { anyhow::bail!("Source file not found: {:?}", file); }
+
+            if file.is_dir() {
+                println!("📂 Uploading directory: {:?}", file);
+                for entry in WalkDir::new(file).min_depth(1) {
+                    let entry: walkdir::DirEntry = entry?;
+                    if entry.file_type().is_file() {
+                        let path = entry.path();
+                        let relative_path = path.strip_prefix(file)?;
+                        // Normalize paths to forward slashes for internal consistency
+                        let clean_relative = relative_path.to_string_lossy().replace("\\", "/");
+                        let clean_dest = dest.trim_end_matches('/');
+                        let vault_dest = format!("{}/{}", clean_dest, clean_relative);
+                        
+                        upload_file(path, &vault_dest, &block_mgr, &mut index_mgr, &key)?;
+                    }
+                }
+            } else {
+                upload_file(file, dest, &block_mgr, &mut index_mgr, &key)?;
+            }
+
+            index_mgr.save(&key)?;
+            println!("✅ Upload complete.");
+        }
+
+        // --- 3. LS ---
+        Commands::Ls { vault } => {
+            let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(vault))?;
+            let index_mgr = IndexManager::load(vault_path, &key)?;
+
+            println!("\n📂 Vault Contents:");
+            println!("{:<12} | {:<40}", "SIZE", "PATH");
+            println!("{:-<60}", "-");
+            
+            let mut paths: Vec<_> = index_mgr.data.files.keys().collect();
+            paths.sort();
+
+            for path in paths {
+                let entry = &index_mgr.data.files[path];
+                let size_str = humansize::format_size(entry.size, humansize::BINARY);
+                println!("{:<12} | {}", size_str, path);
+            }
+            println!();
+        }
+
+        // --- 4. GET ---
+        Commands::Get { src, out, vault } => {
+            let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(vault))?;
+            let index_mgr = IndexManager::load(vault_path.clone(), &key)?;
+            let block_mgr = BlockManager::new(&vault_path)?;
+
+            if let Some(entry) = index_mgr.get_file(src) {
+                println!("📥 Downloading {} ({})", src, humansize::format_size(entry.size, humansize::BINARY));
+                
+                let mut full_data = Vec::with_capacity(entry.size as usize);
+                for block_id in &entry.blocks {
+                    let mut chunk = block_mgr.read_block(block_id, &key)?;
+                    full_data.append(&mut chunk);
+                }
+
+                if let Some(parent) = out.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(out, full_data)?;
+                println!("✅ Saved to {:?}", out);
+            } else {
+                anyhow::bail!("File not found in vault: {}", src);
+            }
+        }
+
+        // --- 5. REPAIR ---
+        Commands::Repair { vault } => {
+            println!("🛠️  Starting repair process...");
+            let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(vault))?;
+
+            match IndexManager::load(vault_path, &key) {
+                Ok(mut index_mgr) => {
+                    println!("✅ Valid index replica found (Rev: {}).", index_mgr.data.revision);
+                    println!("🔄 Resyncing all replicas...");
+                    index_mgr.save(&key)?;
+                    println!("✅ Repair complete.");
+                },
+                Err(e) => {
+                    error!("Repair failed: {}", e);
+                    anyhow::bail!("CRITICAL: Could not recover index. Vault may be corrupted.");
+                }
+            }
+        }
+
+        // --- 6. MOUNT (WebDAV) ---
+        Commands::Mount { vault, mountpoint } => {
+            let vault_path = resolve_vault_path(vault.as_deref())?;
+            println!("🔓 Unlocking vault at {:?}...", vault_path);
+
+            let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(vault_path.to_str().unwrap()))?;
+            let index_mgr = IndexManager::load(vault_path.clone(), &key)?;
+            let block_mgr = BlockManager::new(&vault_path)?;
+
+            // Setup Filesystem
+            let lethe_fs = fs_webdav::LetheWebDav {
+                index: Arc::new(tokio::sync::Mutex::new(index_mgr)),
+                storage: Arc::new(block_mgr),
+                key: Arc::new(key),
+            };
+
+            let dav_server = dav_server::DavHandler::builder()
+                .filesystem(Box::new(lethe_fs))
+                .build_handler();
+
+            let port = 4918;
+            let addr = ([127, 0, 0, 1], port);
+            
+            // Start Server
+            println!("🚀 Lethe Server starting at http://127.0.0.1:{}", port);
+            let server_handle = tokio::spawn(async move {
+                warp::serve(dav_server::warp::dav_handler(dav_server))
+                    .run(addr)
+                    .await;
+            });
+
+            // WINDOWS MOUNT LOGIC
+            #[cfg(target_os = "windows")]
+            {
+                let drive_letter = mountpoint.clone().unwrap_or_else(|| "Z:".to_string());
+                
+                // Initialize the Guard. If main() exits for ANY reason after this, 
+                // the guard will drop and force-unmount the drive.
+                let _guard = MountGuard { drive: drive_letter.clone() };
+
+                println!("🔄 Mounting to Drive {}...", drive_letter);
+                
+                // Pre-clean (just in case)
+                let _ = Command::new("net")
+                    .args(&["use", &drive_letter, "/delete", "/y"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                // Mount
+                let status = Command::new("net")
+                    .args(&["use", &drive_letter, &format!("http://127.0.0.1:{}", port)])
+                    .status()?;
+
+                if status.success() {
+                    println!("✅ Mounted successfully!");
+                    // --- NEW: COSMETIC RENAME ---
+                    // It changes how it looks in "This PC", but doesn't change the underlying technical name.
+                    let label = format!("Lethe Vault");
+                    let rename_script = format!(
+                        "$sh = New-Object -ComObject Shell.Application; $sh.NameSpace('{}').Self.Name = '{}'", 
+                        drive_letter, 
+                        label
+                    );
+                    
+                    let _ = Command::new("powershell")
+                        .args(&["-NoProfile", "-Command", &rename_script])
+                        .stdout(std::process::Stdio::null()) // Hides output
+                        .status();
+
+                    println!("📂 Opening Explorer...");
+                    let _ = Command::new("explorer").arg(&drive_letter).spawn();
+                } else {
+                    error!("Mount failed.");
+                    eprintln!("⚠️  Could not map drive letter. The server is still running.");
+                    eprintln!("   You can access it manually via: http://127.0.0.1:{}", port);
+                }
+
+                println!("Press Ctrl+C to unmount and exit.");
+                
+                // Block until signal
+                tokio::signal::ctrl_c().await?;
+                println!("🛑 Stopping server...");
+                // _guard drops here, executing 'net use /delete' automatically.
+            }
+
+            // LINUX MOUNT LOGIC
+            #[cfg(target_os = "linux")]
+            {
+                println!("🐧 Linux detected.");
+                println!("📂 Opening file manager at dav://127.0.0.1:{}", port);
+                
+                let _ = Command::new("xdg-open")
+                    .arg(format!("dav://127.0.0.1:{}", port))
+                    .spawn();
+
+                println!("(Press Ctrl+C to stop)");
+                tokio::signal::ctrl_c().await?;
+                println!("🛑 Stopping server...");
+            }
+            
+            // Abort server task
+            server_handle.abort();
+        }
+
+        // --- 7. PANIC ---
+        Commands::Panic => {
+            println!("🚨 PANIC SEQUENCE INITIATED 🚨");
+            println!("   Forcing unmount of all Lethe drives...");
+            
+            #[cfg(target_os = "windows")]
+            {
+                // Aggressively kill common drive letters just in case
+                for drive in ["Z:", "Y:", "X:"] {
+                    let _ = Command::new("net")
+                        .args(&["use", drive, "/delete", "/y"])
+                        .stdout(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            println!("✅ Cleanup commands sent.");
+        }
+    }
+
+    Ok(())
+}
+
+// --- HELPER FUNCTIONS ---
+
+fn resolve_vault_path(path: Option<&str>) -> Result<PathBuf> {
+    match path {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => dirs::home_dir()
+            .map(|p| p.join(".lethe_vault"))
+            .context("Could not determine home directory"),
+    }
+}
+
+fn unlock_vault(vault_path_str: &str) -> Result<(PathBuf, MasterKey)> {
+    let vault_path = resolve_vault_path(Some(vault_path_str))?;
+    let salt_path = vault_path.join("salt.loader");
+
+    if !salt_path.exists() {
+        anyhow::bail!("Invalid vault path: {:?}. (Did you run 'lethe init'?)", vault_path);
+    }
+
+    // Use rpassword for secure entry
+    let password = rpassword::prompt_password("Enter Vault Password: ")?;
+    let salt = fs::read_to_string(salt_path).context("Failed to read salt file")?;
+    
+    let (key, _) = CryptoEngine::derive_key_with_salt(&password, salt.trim())?;
+    Ok((vault_path, key))
+}
+
+fn upload_file(
+    path: &Path,
+    dest: &str,
+    block_mgr: &BlockManager,
+    index_mgr: &mut IndexManager,
+    key: &MasterKey
+) -> Result<()> {
+    print!("Processing {} ... ", path.display());
+    io::stdout().flush()?;
+
+    let data = fs::read(path).context("Failed to read source file")?;
+    let size = data.len() as u64;
+
+    let block_id = block_mgr.write_block(&data, key)?;
+    
+    // WebDAV treats paths as /path/to/file. Ensure we don't have double slashes.
+    let clean_dest = dest.replace("//", "/");
+    
+    index_mgr.add_file(clean_dest, vec![block_id], size);
+
+    println!("OK");
+    Ok(())
+}
+```
+
+*lethe_core\Cargo.toml*
+```
+[package]
+name = "lethe_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# --- Serialization (Saving the Index) ---
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11" # Binary format for index files (smaller/faster than JSON)
+
+# --- Cryptography (The Security Layer) ---
+# XChaCha20-Poly1305: Authenticated Encryption (better than AES-GCM for this)
+chacha20poly1305 = "0.10" 
+
+# Argon2: State-of-the-art password hashing for deriving the MasterKey
+argon2 = "0.5" 
+
+# Randomness for salts and nonces
+rand = "0.8"
+
+# Clears memory on drop (prevents password from staying in RAM)
+zeroize = { version = "1.7", features = ["derive"] }
+
+# --- Compression ---
+# Zstandard: High compression ratio, very fast decompression
+zstd = "0.13"
+
+# --- Utilities ---
+uuid = { version = "1.6", features = ["v4", "serde"] } # For block IDs
+anyhow = "1.0"
+thiserror = "1.0"
+```
+
+*lethe_core\src\config.rs*
+```
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultConfig {
+    /// Size of each block in bytes (default: 65536)
+    pub block_size: usize,
+    /// Zstd compression level (1-22)
+    pub compression_level: i32,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            block_size: 65536, // 64KB
+            compression_level: 3,
+        }
+    }
+}
+```
+
+*lethe_core\src\crypto.rs*
+```
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce
+};
+use argon2::{
+    password_hash::{rand_core::OsRng, SaltString},
+    Argon2, PasswordHasher
+};
+use rand::RngCore;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+use anyhow::{Result, Context};
+
+const KEY_SIZE: usize = 32;
+const NONCE_SIZE: usize = 24;
+
+#[derive(Zeroize, ZeroizeOnDrop, Debug)]
+pub struct MasterKey {
+    key: [u8; KEY_SIZE],
+}
+
+impl MasterKey {
+    pub fn new(bytes: [u8; KEY_SIZE]) -> Self {
+        Self { key: bytes }
+    }
+    
+    pub fn as_bytes(&self) -> &[u8; KEY_SIZE] {
+        &self.key
+    }
+}
+
+pub struct CryptoEngine;
+
+impl CryptoEngine {
+    /// Generates a NEW salt and derives a key (For "Init")
+    pub fn derive_key(password: &str) -> Result<(MasterKey, String)> {
+        let salt = SaltString::generate(&mut OsRng);
+        Self::derive_internal(password, &salt)
+    }
+
+    /// Uses an EXISTING salt to derive the key (For "Unlock")
+    pub fn derive_key_with_salt(password: &str, salt_str: &str) -> Result<(MasterKey, String)> {
+        let salt = SaltString::from_b64(salt_str)
+            .map_err(|e| anyhow::anyhow!("Invalid salt format: {}", e))?;
+        Self::derive_internal(password, &salt)
+    }
+
+    fn derive_internal(password: &str, salt: &SaltString) -> Result<(MasterKey, String)> {
+        let argon2 = Argon2::default();
+        let password_hash = argon2.hash_password(password.as_bytes(), salt)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let output = password_hash.hash.context("Argon2 hashing failed")?;
+        
+        if output.len() < KEY_SIZE {
+            return Err(anyhow::anyhow!("Argon2 output too short"));
+        }
+        
+        let mut key_bytes = [0u8; KEY_SIZE];
+        key_bytes.copy_from_slice(&output.as_bytes()[..KEY_SIZE]);
+        
+        Ok((MasterKey::new(key_bytes), salt.as_str().to_string()))
+    }
+
+    pub fn encrypt(data: &[u8], key: &MasterKey) -> Result<(Vec<u8>, Vec<u8>)> {
+        let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
+        let mut nonce_bytes = [0u8; NONCE_SIZE];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, data)
+            .map_err(|_| anyhow::anyhow!("Encryption failure"))?;
+        
+        Ok((ciphertext, nonce_bytes.to_vec()))
+    }
+
+    pub fn decrypt(ciphertext: &[u8], nonce: &[u8], key: &MasterKey) -> Result<Vec<u8>> {
+        if nonce.len() != NONCE_SIZE {
+            return Err(anyhow::anyhow!("Invalid nonce length"));
+        }
+        
+        let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
+        let nonce = XNonce::from_slice(nonce);
+
+        let plaintext = cipher.decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow::anyhow!("Decryption failed (Wrong password or corrupted data)"))?;
+        
+        Ok(plaintext)
+    }
+}
+```
+
+*lethe_core\src\index.rs*
+```
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+use anyhow::{Result, Context};
+use crate::crypto::{CryptoEngine, MasterKey};
+
+/// The logical structure of a file inside the vault
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileEntry {
+    pub path: String,       
+    pub size: u64,          
+    pub modified: u64,      // Unix timestamp
+    pub blocks: Vec<String>,// List of UUIDs: ["uuid1", "uuid2"]
+
+    #[serde(default)] 
+    pub is_dir: bool,
+}
+
+/// The entire "Database" of the filesystem
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VaultIndex {
+    pub version: u8,
+    pub revision: u64,      // Increments on every save (for conflict resolution)
+    pub salt: String,       // The salt used for the MasterKey
+    pub files: HashMap<String, FileEntry>, // Path -> File Info
+}
+
+impl VaultIndex {
+    pub fn new(salt: String) -> Self {
+        Self {
+            version: 1,
+            revision: 0,
+            salt,
+            files: HashMap::new(),
+        }
+    }
+}
+
+/// Manages the loading, saving, and syncing of the Index
+#[derive(Debug)]
+pub struct IndexManager {
+    root_path: PathBuf,
+    pub data: VaultIndex,
+}
+
+impl IndexManager {
+    /// Initialize a manager. 
+    /// If index exists on disk, use load() instead.
+    pub fn new_empty(path: PathBuf, salt: String) -> Self {
+        Self {
+            root_path: path,
+            data: VaultIndex::new(salt),
+        }
+    }
+
+    /// Tries to load the index from 3 replicas. 
+    /// Picks the one with the highest revision number that successfully decrypts.
+    pub fn load(path: PathBuf, key: &MasterKey) -> Result<Self> {
+        let mut candidates = Vec::new();
+
+        // Try to load all 3 replicas
+        for i in 0..3 {
+            let file_path = path.join(format!("meta_{}.bin", i));
+            if file_path.exists() {
+                if let Ok(index) = Self::read_and_decrypt(&file_path, key) {
+                    candidates.push(index);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(anyhow::anyhow!("No valid index found. Vault corrupted or wrong password."));
+        }
+
+        // Sort by revision (highest first)
+        candidates.sort_by(|a, b| b.revision.cmp(&a.revision));
+        
+        // Pick the winner
+        let best_index = candidates.remove(0);
+        
+        Ok(Self {
+            root_path: path,
+            data: best_index,
+        })
+    }
+
+    /// Saves the current index state to all 3 replicas safely.
+    pub fn save(&mut self, key: &MasterKey) -> Result<()> {
+        self.data.revision += 1; // Increment revision
+
+        // Serialize to CBOR
+        let plain_data = serde_cbor::to_vec(&self.data)
+            .context("Failed to serialize index")?;
+
+        // Encrypt
+        let (encrypted_data, nonce) = CryptoEngine::encrypt(&plain_data, key)?;
+
+        // Write to all 3 replicas
+        for i in 0..3 {
+            let file_name = format!("meta_{}.bin", i);
+            let tmp_name = format!("meta_{}.tmp", i);
+            let target_path = self.root_path.join(&file_name);
+            let tmp_path = self.root_path.join(&tmp_name);
+
+            // 1. Write to .tmp first (Atomic write pattern)
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&nonce)?;
+            file.write_all(&encrypted_data)?;
+            
+            // 2. Rename .tmp to .bin (Atomic replace)
+            fs::rename(&tmp_path, &target_path)?;
+        }
+
+        Ok(())
+    }
+
+    // --- Helper Functions ---
+
+    fn read_and_decrypt(path: &Path, key: &MasterKey) -> Result<VaultIndex> {
+        let mut file = File::open(path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        if buffer.len() < 24 {
+            return Err(anyhow::anyhow!("Index file too short"));
+        }
+
+        let (nonce, ciphertext) = buffer.split_at(24);
+        
+        let plain_data = CryptoEngine::decrypt(ciphertext, nonce, key)?;
+        
+        let index: VaultIndex = serde_cbor::from_slice(&plain_data)?;
+        Ok(index)
+    }
+
+    pub fn add_file(&mut self, path: String, blocks: Vec<String>, size: u64) {
+        let entry = FileEntry {
+            path: path.clone(),
+            size,
+            modified: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            blocks,
+            is_dir: false,
+        };
+        self.data.files.insert(path, entry);
+    }
+
+    pub fn add_dir(&mut self, path: String) {
+        let entry = FileEntry {
+            path: path.clone(),
+            size: 0,
+            modified: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            blocks: vec![],
+            is_dir: true,
+        };
+        self.data.files.insert(path, entry);
+    }
+    
+    pub fn get_file(&self, path: &str) -> Option<&FileEntry> {
+        self.data.files.get(path)
+    }
+}
+```
+
+*lethe_core\src\lib.rs*
+```
+pub mod crypto;
+pub mod storage;
+pub mod index;
+pub mod config;
+
+pub use config::VaultConfig;
+```
+
+*lethe_core\src\storage.rs*
+```
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+use anyhow::{Result, Context};
+use crate::crypto::{CryptoEngine, MasterKey};
+
+/// Manages the physical storage of encrypted blocks on disk.
+#[derive(Debug)]
+pub struct BlockManager {
+    root_path: PathBuf,
+}
+
+impl BlockManager {
+    /// Initialize the manager pointing to a specific directory
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let root_path = path.as_ref().to_path_buf();
+        
+        // Ensure directory exists
+        if !root_path.exists() {
+            fs::create_dir_all(&root_path)
+                .context("Failed to create vault directory")?;
+        }
+        
+        Ok(Self { root_path })
+    }
+
+    /// Takes raw data, compresses it, encrypts it, and saves it to disk.
+    /// Returns the UUID of the new block.
+    pub fn write_block(&self, data: &[u8], key: &MasterKey) -> Result<String> {
+        // 1. Compress (Zstd)
+        // Level 3 is a good balance of speed vs ratio
+        let compressed_data = zstd::stream::encode_all(data, 3)
+            .context("Compression failed")?;
+
+        // 2. Encrypt (XChaCha20-Poly1305)
+        // Returns (Ciphertext, Nonce)
+        let (encrypted_data, nonce) = CryptoEngine::encrypt(&compressed_data, key)?;
+
+        // 3. Generate Random ID
+        let block_id = Uuid::new_v4().to_string();
+        let file_path = self.root_path.join(format!("blk_{}.bin", block_id));
+
+        // 4. Write to Disk (Nonce + Encrypted Data)
+        let mut file = File::create(&file_path)
+            .context("Failed to create block file")?;
+        
+        // We prepend the nonce to the file so we can read it back later
+        file.write_all(&nonce)?;
+        file.write_all(&encrypted_data)?;
+
+        Ok(block_id)
+    }
+
+    /// Reads a block ID, reads disk, decrypts, and decompresses.
+    pub fn read_block(&self, block_id: &str, key: &MasterKey) -> Result<Vec<u8>> {
+        let file_path = self.root_path.join(format!("blk_{}.bin", block_id));
+        
+        // 1. Read File
+        let mut file = File::open(&file_path)
+            .context(format!("Block not found: {}", block_id))?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        // 2. Split Nonce (First 24 bytes) and Data
+        // XChaCha20 nonce is 24 bytes
+        if buffer.len() < 24 {
+            return Err(anyhow::anyhow!("Block file corrupted or too short"));
+        }
+        let (nonce, ciphertext) = buffer.split_at(24);
+
+        // 3. Decrypt
+        let compressed_data = CryptoEngine::decrypt(ciphertext, nonce, key)
+            .context("Decryption failed (Wrong password or corrupted block)")?;
+
+        // 4. Decompress
+        let original_data = zstd::stream::decode_all(compressed_data.as_slice())
+            .context("Decompression failed")?;
+
+        Ok(original_data)
+    }
+
+    /// Deletes a block permanently
+    pub fn delete_block(&self, block_id: &str) -> Result<()> {
+        let file_path = self.root_path.join(format!("blk_{}.bin", block_id));
+        if file_path.exists() {
+            fs::remove_file(file_path).context("Failed to delete block")?;
+        }
+        Ok(())
+    }
+}
+```
+
