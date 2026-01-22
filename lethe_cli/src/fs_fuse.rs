@@ -2,20 +2,19 @@
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyWrite, ReplyCreate, ReplyEmpty, Request, TimeOrNow,
+    ReplyWrite, ReplyCreate, ReplyEmpty, ReplyOpen, Request, TimeOrNow,
 };
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use std::collections::{HashMap, HashSet};
-
-use libc::{ENOENT, ENOTEMPTY};
-
 use lethe_core::index::IndexManager;
 use lethe_core::storage::BlockManager;
 use lethe_core::crypto::MasterKey;
 
-const TTL: Duration = Duration::from_secs(1);
+// --- CROSS PLATFORM ERROR CODES ---
+use libc::{ENOENT, EACCES, ENOTEMPTY};
 
+const TTL: Duration = Duration::from_secs(1);
 
 pub struct LetheFS {
     pub index: IndexManager,
@@ -26,7 +25,6 @@ pub struct LetheFS {
 }
 
 impl LetheFS {
-
     fn resolve_path(&self, parent_ino: u64, name: &OsStr) -> Option<String> {
         let parent_path = self.inode_map.get(&parent_ino)?;
         let name_str = name.to_string_lossy();
@@ -39,23 +37,16 @@ impl LetheFS {
     }
 
     fn get_file_attr(&self, path: &str, ino: u64) -> FileAttr {
-        // 1. Root Directory
-        if path == "/" {
-            return self.attr_dir(ino);
-        }
+        if path == "/" { return self.attr_dir(ino); }
 
-        // 2. Regular File (In Index)
-        if let Some(entry) = self.index.get_file(path) {
-            return self.attr_file(ino, entry.size);
-        }
-
-        // 3. Regular File (In Write Buffer)
         if let Some(buffer) = self.write_buffer.get(&ino) {
             return self.attr_file(ino, buffer.len() as u64);
         }
 
-        // 4. Implicit Directory (Not in index, but has entry in map)
-        // (If logic reached here, it's a directory)
+        if let Some(entry) = self.index.get_file(path) {
+            return self.attr_file(ino, entry.size);
+        }
+
         self.attr_dir(ino)
     }
 
@@ -84,9 +75,12 @@ impl Filesystem for LetheFS {
         if let Some(path) = self.resolve_path(parent, name) {
             let ino = fxhash::hash64(&path);
             
-            // If it exists in map OR buffer, return it
-            if self.inode_map.contains_key(&ino) || self.write_buffer.contains_key(&ino) {
-                self.inode_map.insert(ino, path.clone()); // Ensure map has it
+            // Allow lookup if it exists in map, buffer, OR index
+            if self.inode_map.contains_key(&ino) || 
+               self.write_buffer.contains_key(&ino) || 
+               self.index.get_file(&path).is_some() {
+                
+                self.inode_map.insert(ino, path.clone());
                 reply.entry(&TTL, &self.get_file_attr(&path, ino), 0);
                 return;
             }
@@ -105,7 +99,7 @@ impl Filesystem for LetheFS {
         }
     }
 
-    // 3. SET ATTR
+    // 3. SET ATTR (Resize/Truncate)
     fn setattr(
         &mut self, _req: &Request, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>,
         size: Option<u64>, _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>,
@@ -114,9 +108,25 @@ impl Filesystem for LetheFS {
     ) {
         if let Some(path) = self.inode_map.get(&ino).cloned() {
             if let Some(new_size) = size {
-                 if let Some(buffer) = self.write_buffer.get_mut(&ino) {
+                // Ensure buffer exists before resizing
+                if !self.write_buffer.contains_key(&ino) {
+                    // Load existing data if we are resizing a file that isn't open
+                    if let Some(entry) = self.index.get_file(&path) {
+                         let mut full_data = Vec::new();
+                         for block_id in &entry.blocks {
+                             if let Ok(mut chunk) = self.storage.read_block(block_id, &self.key) {
+                                 full_data.append(&mut chunk);
+                             }
+                         }
+                         self.write_buffer.insert(ino, full_data);
+                    } else {
+                         self.write_buffer.insert(ino, Vec::new());
+                    }
+                }
+
+                if let Some(buffer) = self.write_buffer.get_mut(&ino) {
                      buffer.resize(new_size as usize, 0);
-                 }
+                }
             }
             reply.attr(&TTL, &self.get_file_attr(&path, ino));
         } else {
@@ -135,11 +145,9 @@ impl Filesystem for LetheFS {
             (ino, FileType::Directory, ".".to_string()),
             (ino, FileType::Directory, "..".to_string()),
         ];
-
         let mut seen = HashSet::new();
 
         for (child_ino, child_path) in &self.inode_map {
-            // Check if child_path is direct child of dir_path
             let is_child = if dir_path == "/" {
                 child_path.starts_with('/') && child_path.matches('/').count() == 1
             } else {
@@ -174,7 +182,33 @@ impl Filesystem for LetheFS {
         reply.ok();
     }
 
-    // 5. CREATE
+    // 5. OPEN
+    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+        if self.write_buffer.contains_key(&ino) {
+            reply.opened(0, 0);
+            return;
+        }
+
+        if let Some(path) = self.inode_map.get(&ino).cloned() {
+            if let Some(entry) = self.index.get_file(&path) {
+                let mut full_data = Vec::new();
+                for block_id in &entry.blocks {
+                    if let Ok(mut chunk) = self.storage.read_block(block_id, &self.key) {
+                        full_data.append(&mut chunk);
+                    }
+                }
+                self.write_buffer.insert(ino, full_data);
+                reply.opened(0, 0);
+            } else {
+                self.write_buffer.insert(ino, Vec::new());
+                reply.opened(0, 0);
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    // 6. CREATE
     fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         if let Some(path) = self.resolve_path(parent, name) {
             let ino = fxhash::hash64(&path);
@@ -186,7 +220,7 @@ impl Filesystem for LetheFS {
         }
     }
 
-    // 6. WRITE
+    // 7. WRITE
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _wflags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
         if let Some(buffer) = self.write_buffer.get_mut(&ino) {
             let end = offset as usize + data.len();
@@ -198,9 +232,8 @@ impl Filesystem for LetheFS {
         }
     }
 
-    // 7. READ
+    // 8. READ
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
-        // Read from RAM Buffer
         if let Some(buffer) = self.write_buffer.get(&ino) {
              let end = std::cmp::min((offset as u64 + size as u64) as usize, buffer.len());
              if offset as usize >= buffer.len() { reply.data(&[]); } 
@@ -208,7 +241,6 @@ impl Filesystem for LetheFS {
              return;
         }
         
-        // Read from Disk
         if let Some(path) = self.inode_map.get(&ino) {
              if let Some(entry) = self.index.get_file(path) {
                 let mut full_data = Vec::new();
@@ -228,7 +260,7 @@ impl Filesystem for LetheFS {
         }
     }
 
-    // 8. RELEASE
+    // 9. RELEASE
     fn release(&mut self, _req: &Request, ino: u64, _fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
         if let Some(data) = self.write_buffer.remove(&ino) {
             if let Some(path) = self.inode_map.get(&ino).cloned() {
@@ -241,7 +273,7 @@ impl Filesystem for LetheFS {
         reply.ok();
     }
 
-    // 9. UNLINK
+    // 10. UNLINK
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if let Some(path) = self.resolve_path(parent, name) {
             if self.index.data.files.remove(&path).is_some() {
@@ -258,13 +290,12 @@ impl Filesystem for LetheFS {
         }
     }
 
-    // 10. RMDIR
+    // 11. RMDIR
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if let Some(dir_path) = self.resolve_path(parent, name) {
             let is_empty = !self.index.data.files.keys().any(|k| {
                  k.starts_with(&dir_path) && k.len() > dir_path.len() && k.chars().nth(dir_path.len()) == Some('/')
             });
-
             if is_empty {
                 let ino = fxhash::hash64(&dir_path);
                 self.inode_map.remove(&ino);
@@ -277,7 +308,7 @@ impl Filesystem for LetheFS {
         }
     }
 
-    // 11. RENAME
+    // 12. RENAME
     fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let old_path_opt = self.resolve_path(parent, name);
         let new_path_opt = self.resolve_path(newparent, newname);
