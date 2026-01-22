@@ -116,8 +116,8 @@ pub async fn do_mount(vault: Option<String>, mountpoint: Option<String>) -> Resu
             index: index_mgr,
             storage: block_mgr,
             key: key,
-            inode_map: HashMap::new(),   // Start empty
-            write_buffer: HashMap::new(), // Start empty
+            inode_map: HashMap::new(),
+            write_buffer: HashMap::new(),
         };
 
         // Standard FUSE mount options
@@ -131,6 +131,32 @@ pub async fn do_mount(vault: Option<String>, mountpoint: Option<String>) -> Resu
         fuser::mount2(fs, &mount_path, &options)?;
         
         println!("\nUnmounted successfully.");
+    }
+
+    Ok(())
+}
+
+// =========================================================
+//  THE MISSING FUNCTION 
+// =========================================================
+pub fn do_panic() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        for drive in ["Z:", "Y:", "X:"] {
+            let _ = std::process::Command::new("net")
+                .args(&["use", drive, "/delete", "/y"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        println!("Panic Cleanup: Attempted to unmount Z:, Y:, X:");
+    }
+
+    #[cfg(unix)]
+    {
+        println!("Panic command is a Windows-specific cleanup tool.");
+        println!("On Unix, FUSE handles auto-unmount.");
+        println!("If stuck, try: fusermount -u <path>");
     }
 
     Ok(())
