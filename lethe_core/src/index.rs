@@ -56,6 +56,10 @@ impl IndexManager {
         }
     }
 
+    pub fn root_path(&self) -> &PathBuf {
+        &self.root_path
+    }
+
     /// Tries to load the index from 3 replicas. 
     /// Picks the one with the highest revision number that successfully decrypts.
     pub fn load(path: PathBuf, key: &MasterKey) -> Result<Self> {

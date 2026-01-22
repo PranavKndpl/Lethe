@@ -38,4 +38,9 @@ pub enum Commands {
         #[arg(long)] vault: String 
     },
     Panic,
+    Clean {
+        #[arg(long)] vault: String,
+        #[arg(long, default_value_t = false)] dry_run: bool,
+    },
+
 }

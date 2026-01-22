@@ -1,6 +1,6 @@
 // lethe_cli/src/main.rs
-mod dav;
 mod cli;
+mod dav; 
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,5 +19,6 @@ async fn main() -> Result<()> {
         Commands::Repair { vault } => cli::ops::do_repair(vault),
         Commands::Mount { vault, mountpoint } => cli::mount::do_mount(vault, mountpoint).await,
         Commands::Panic => cli::mount::do_panic(),
+        Commands::Clean { vault, dry_run } => cli::ops::do_clean(vault, dry_run),
     }
 }

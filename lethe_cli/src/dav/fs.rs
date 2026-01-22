@@ -1,15 +1,15 @@
 // lethe_cli/src/dav/fs.rs
-use super::file::LetheDavFile;
-use crate::dav::state::LetheState;
-use dav_server::fs::{DavFileSystem, DavFile, DavDirEntry, FsFuture, FsError, OpenOptions, ReadDirMeta};
+use std::io::Cursor;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
+use dav_server::fs::{DavFileSystem, DavFile, DavDirEntry, DavMetaData, FsFuture, FsError, OpenOptions, ReadDirMeta};
 use dav_server::davpath::DavPath;
-use std::sync::Arc;
-use futures_util::stream;
-use std::time::UNIX_EPOCH;
+use super::state::LetheState;
+use super::file::{LetheDavFile, LetheMetaData};
 
 #[derive(Clone)]
 pub struct LetheWebDav {
-    pub state: Arc<LetheState>,
+    pub state: LetheState,
 }
 
 impl DavFileSystem for LetheWebDav {
@@ -18,53 +18,34 @@ impl DavFileSystem for LetheWebDav {
         let state = self.state.clone();
 
         Box::pin(async move {
-            let guard = state.get_resources().await.ok_or(FsError::Forbidden)?;
+            let index = state.index.lock().await;
+            let mut data = Vec::new();
 
-            if options.write && options.truncate {
-                return Ok(Box::new(LetheDavFile {
-                    index: guard.index.clone(),
-                    storage: guard.storage.clone(),
-                    key: guard.key.clone(),
-                    path: path_str.clone(),
-                    read_blocks: vec![],
-                    file_size: 0,
-                    pos: 0,
-                    write_buffer: Vec::with_capacity(65536),
-                    new_block_ids: Vec::new(),
-                    is_dirty: true,
-                }) as Box<dyn DavFile>);
-            }
-
-            let index = guard.index.lock().await;
+            // 1. Try to find the file.
             if let Some(entry) = index.get_file(&path_str) {
-                Ok(Box::new(LetheDavFile {
-                    index: guard.index.clone(),
-                    storage: guard.storage.clone(),
-                    key: guard.key.clone(),
-                    path: path_str.clone(),
-                    read_blocks: entry.blocks.clone(),
-                    file_size: entry.size,
-                    pos: 0,
-                    write_buffer: Vec::new(),
-                    new_block_ids: Vec::new(),
-                    is_dirty: false,
-                }) as Box<dyn DavFile>)
-            } else if options.write {
-                Ok(Box::new(LetheDavFile {
-                    index: guard.index.clone(),
-                    storage: guard.storage.clone(),
-                    key: guard.key.clone(),
-                    path: path_str.clone(),
-                    read_blocks: vec![],
-                    file_size: 0,
-                    pos: 0,
-                    write_buffer: Vec::with_capacity(65536),
-                    new_block_ids: Vec::new(),
-                    is_dirty: true,
-                }) as Box<dyn DavFile>)
-            } else {
-                Err(FsError::NotFound)
+                if entry.is_dir { return Err(FsError::Forbidden); }
+
+                if !options.truncate {
+                    for block_id in &entry.blocks {
+                        if let Ok(mut chunk) = state.storage.read_block(block_id, &state.key) {
+                            data.append(&mut chunk);
+                        }
+                    }
+                }
+            } else if !options.write {
+                // Read on non-existent file -> 404
+                return Err(FsError::NotFound);
             }
+
+            // THE FIX: If writing, assume dirty immediately (handles 0-byte files)
+            let is_dirty = options.write;
+
+            Ok(Box::new(LetheDavFile {
+                buffer: Cursor::new(data),
+                path: path_str,
+                state: state.clone(),
+                is_dirty,
+            }) as Box<dyn DavFile>)
         })
     }
 
@@ -73,10 +54,9 @@ impl DavFileSystem for LetheWebDav {
         let state = self.state.clone();
 
         Box::pin(async move {
-            let guard = state.get_resources().await.ok_or(FsError::Forbidden)?;
-            let index = guard.index.lock().await;
+            let index = state.index.lock().await;
             let mut entries = Vec::new();
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
 
             for full_path in index.data.files.keys() {
                 if let Some(rest) = full_path.strip_prefix(&path_str) {
@@ -86,73 +66,134 @@ impl DavFileSystem for LetheWebDav {
                     let name = clean_rest.split('/').next().unwrap_or("");
                     if !name.is_empty() && !seen.contains(name) {
                         seen.insert(name.to_string());
+                        
+                        let child_full_path = if path_str == "/" { format!("/{}", name) } 
+                                              else { format!("{}/{}", path_str.trim_end_matches('/'), name) };
 
-                        let is_file = index.get_file(full_path).is_some();
-                        let meta = if is_file {
-                            let e = index.get_file(full_path).unwrap();
-                            super::file::LetheFileMetaData {
+                        let meta = if let Some(e) = index.get_file(&child_full_path) {
+                            LetheMetaData {
                                 len: e.size,
                                 modified: UNIX_EPOCH + std::time::Duration::from_secs(e.modified),
                                 is_dir: e.is_dir,
                                 etag: format!("\"{:x}-{:x}\"", e.size, e.modified),
                             }
                         } else {
-                            super::file::LetheFileMetaData {
-                                len: 0,
-                                modified: UNIX_EPOCH,
-                                is_dir: true,
+                            LetheMetaData {
+                                len: 0, modified: UNIX_EPOCH, is_dir: true, 
                                 etag: format!("\"dir-{}\"", fxhash::hash64(name)),
                             }
                         };
-                        entries.push(Box::new(super::LetheDavDirEntry {
-                            name: name.to_string(),
-                            meta,
-                        }) as Box<dyn DavDirEntry>);
+                        entries.push(Box::new(LetheDavEntry { name: name.to_string(), meta }) as Box<dyn DavDirEntry>);
                     }
                 }
             }
-
-            Ok(Box::pin(stream::iter(entries)) as dav_server::fs::FsStream<Box<dyn DavDirEntry>>)
+            let stream = futures_util::stream::iter(entries);
+            Ok(Box::pin(stream) as dav_server::fs::FsStream<Box<dyn DavDirEntry>>)
         })
     }
 
-    fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<Box<dyn dav_server::fs::DavMetaData>> {
+    fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<Box<dyn DavMetaData>> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
 
         Box::pin(async move {
-            let guard = state.get_resources().await.ok_or(FsError::Forbidden)?;
-            let index = guard.index.lock().await;
+            let index = state.index.lock().await;
 
             if path_str == "/" {
-                return Ok(Box::new(super::file::LetheFileMetaData {
-                    len: 0,
-                    modified: UNIX_EPOCH,
-                    is_dir: true,
-                    etag: "\"root\"".to_string(),
-                }) as Box<dyn dav_server::fs::DavMetaData>);
+                return Ok(Box::new(LetheMetaData {
+                    len: 0, modified: UNIX_EPOCH, is_dir: true, etag: "\"root\"".into()
+                }) as Box<dyn DavMetaData>);
             }
 
-            if let Some(entry) = index.get_file(&path_str) {
-                return Ok(Box::new(super::file::LetheFileMetaData {
-                    len: entry.size,
-                    modified: UNIX_EPOCH + std::time::Duration::from_secs(entry.modified),
-                    is_dir: entry.is_dir,
-                    etag: format!("\"{:x}-{:x}\"", entry.size, entry.modified),
-                }) as Box<dyn dav_server::fs::DavMetaData>);
+            if let Some(e) = index.get_file(&path_str) {
+                return Ok(Box::new(LetheMetaData {
+                    len: e.size,
+                    modified: UNIX_EPOCH + std::time::Duration::from_secs(e.modified),
+                    is_dir: e.is_dir,
+                    etag: format!("\"{:x}-{:x}\"", e.size, e.modified),
+                }) as Box<dyn DavMetaData>);
             }
 
             let is_dir = index.data.files.keys().any(|k| k.starts_with(&format!("{}/", path_str)));
             if is_dir {
-                return Ok(Box::new(super::file::LetheFileMetaData {
-                    len: 0,
-                    modified: UNIX_EPOCH,
-                    is_dir: true,
+                return Ok(Box::new(LetheMetaData {
+                    len: 0, modified: UNIX_EPOCH, is_dir: true, 
                     etag: format!("\"implicit-{}\"", fxhash::hash64(&path_str)),
-                }) as Box<dyn dav_server::fs::DavMetaData>);
+                }) as Box<dyn DavMetaData>);
             }
-
             Err(FsError::NotFound)
         })
+    }
+
+    fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut index = state.index.lock().await;
+            if index.get_file(&path_str).is_some() { return Err(FsError::Exists); }
+            index.add_dir(path_str);
+            let _ = index.save(&state.key);
+            Ok(())
+        })
+    }
+
+    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut index = state.index.lock().await;
+            if index.data.files.keys().any(|k| k.starts_with(&format!("{}/", path_str))) { return Err(FsError::Forbidden); }
+            if index.data.files.remove(&path_str).is_some() {
+                let _ = index.save(&state.key);
+                Ok(())
+            } else { Err(FsError::NotFound) }
+        })
+    }
+
+    fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+        let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut index = state.index.lock().await;
+            if index.data.files.remove(&path_str).is_some() {
+                let _ = index.save(&state.key);
+                Ok(())
+            } else { Err(FsError::NotFound) }
+        })
+    }
+
+    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<()> {
+        let old_path = from.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let new_path = to.as_pathbuf().to_string_lossy().replace("\\", "/");
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut index = state.index.lock().await;
+            let mut to_move = Vec::new();
+            if index.data.files.contains_key(&old_path) { to_move.push(old_path.clone()); }
+            for k in index.data.files.keys() {
+                if k.starts_with(&format!("{}/", old_path)) { to_move.push(k.clone()); }
+            }
+            if to_move.is_empty() { return Err(FsError::NotFound); }
+            for src in to_move {
+                if let Some(mut entry) = index.data.files.remove(&src) {
+                    let suffix = src.strip_prefix(&old_path).unwrap_or("");
+                    let dest = format!("{}{}", new_path, suffix);
+                    entry.path = dest.clone();
+                    index.data.files.insert(dest, entry);
+                }
+            }
+            let _ = index.save(&state.key);
+            Ok(())
+        })
+    }
+}
+
+// Helper Struct
+pub struct LetheDavEntry { pub name: String, pub meta: LetheMetaData }
+impl DavDirEntry for LetheDavEntry {
+    fn name(&self) -> Vec<u8> { self.name.as_bytes().to_vec() }
+    fn metadata(&self) -> FsFuture<Box<dyn DavMetaData>> {
+        let m = self.meta.clone();
+        Box::pin(async move { Ok(Box::new(m) as Box<dyn DavMetaData>) })
     }
 }
