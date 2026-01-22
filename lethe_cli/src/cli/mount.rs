@@ -111,12 +111,15 @@ pub async fn do_mount(vault: Option<String>, mountpoint: Option<String>) -> Resu
         println!("Mounting FUSE filesystem at {:?}", mount_path);
         println!("   (Press Ctrl+C to unmount)");
 
+        let mut inode_map = HashMap::new();
+        inode_map.insert(1, "/".to_string());
+
         // Initialize the LetheFS struct
         let fs = LetheFS {
             index: index_mgr,
             storage: block_mgr,
             key: key,
-            inode_map: HashMap::new(),
+            inode_map,
             write_buffer: HashMap::new(),
         };
 
@@ -125,6 +128,7 @@ pub async fn do_mount(vault: Option<String>, mountpoint: Option<String>) -> Resu
             fuser::MountOption::RW,
             fuser::MountOption::FSName("lethe".to_string()),
             fuser::MountOption::AutoUnmount,
+            fuser::MountOption::AllowOther,
         ];
 
         // This call blocks until the filesystem is unmounted (Ctrl+C)
