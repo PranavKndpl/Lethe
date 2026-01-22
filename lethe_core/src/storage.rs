@@ -16,7 +16,6 @@ impl BlockManager {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         
-        // Ensure directory exists
         if !root_path.exists() {
             fs::create_dir_all(&root_path)
                 .context("Failed to create vault directory")?;

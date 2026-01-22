@@ -1,6 +1,4 @@
-// lethe_cli/src/cli/ops.rs
-
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use log::error;
 use std::fs;
 use std::io::{self, Write};
@@ -11,7 +9,6 @@ use lethe_core::crypto::{CryptoEngine, MasterKey};
 use lethe_core::index::IndexManager;
 use lethe_core::storage::BlockManager;
 
-// Add these imports at the top
 use std::collections::HashSet;
 use std::ffi::OsStr;
 
@@ -57,8 +54,6 @@ fn upload_worker(
     let data = fs::read(path).context("Failed to read source file")?;
     let size = data.len() as u64;
 
-    // Note: This is still the "simple" upload.
-    // Ideally this should use the chunking logic too, but it's acceptable for CLI tool v1.
     let block_id = block_mgr.write_block(&data, key)?;
 
     let clean_dest = dest.replace("//", "/");
@@ -76,7 +71,7 @@ pub fn do_init(path: Option<String>) -> Result<()> {
         anyhow::bail!("Vault already exists at {:?}", vault_path);
     }
 
-    println!("🛡️  Initializing vault at: {:?}", vault_path);
+    println!("Initializing vault at: {:?}", vault_path);
 
     let password = rpassword::prompt_password("Set Master Password: ")?;
     let confirm = rpassword::prompt_password("Confirm Password: ")?;
@@ -90,7 +85,7 @@ pub fn do_init(path: Option<String>) -> Result<()> {
 
     fs::create_dir_all(&vault_path).context("Failed to create vault directory")?;
 
-    println!("🔑 Generating keys (Argon2id)...");
+    println!("Generating keys (Argon2id)...");
 
     let (key, salt) = tokio::task::block_in_place(|| CryptoEngine::derive_key(&password))?;
     fs::write(vault_path.join("salt.loader"), &salt).context("Failed to write salt")?;
@@ -100,7 +95,7 @@ pub fn do_init(path: Option<String>) -> Result<()> {
 
     let _ = BlockManager::new(&vault_path)?;
 
-    println!("✅ Vault initialized successfully.");
+    println!("Vault initialized successfully.");
     Ok(())
 }
 
@@ -114,7 +109,7 @@ pub fn do_put(file: PathBuf, dest: String, vault: String) -> Result<()> {
     }
 
     if file.is_dir() {
-        println!("📂 Uploading directory: {:?}", file);
+        println!("Uploading directory: {:?}", file);
 
         for entry in WalkDir::new(&file).min_depth(1) {
             let entry = entry?;
@@ -134,7 +129,7 @@ pub fn do_put(file: PathBuf, dest: String, vault: String) -> Result<()> {
     }
 
     index_mgr.save(&key)?;
-    println!("✅ Upload complete.");
+    println!("Upload complete.");
     Ok(())
 }
 
@@ -142,7 +137,7 @@ pub fn do_ls(vault: String) -> Result<()> {
     let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(&vault))?;
     let index_mgr = IndexManager::load(vault_path, &key)?;
 
-    println!("\n📂 Vault Contents:");
+    println!("\nVault Contents:");
     println!("{:<12} | {:<40}", "SIZE", "PATH");
     println!("{:-<60}", "-");
 
@@ -166,7 +161,7 @@ pub fn do_get(src: String, out: PathBuf, vault: String) -> Result<()> {
 
     if let Some(entry) = index_mgr.get_file(&src) {
         println!(
-            "📥 Downloading {} ({})",
+            "Downloading {} ({})",
             src,
             humansize::format_size(entry.size, humansize::BINARY)
         );
@@ -182,7 +177,7 @@ pub fn do_get(src: String, out: PathBuf, vault: String) -> Result<()> {
         }
 
         fs::write(&out, full_data)?;
-        println!("✅ Saved to {:?}", out);
+        println!("Saved to {:?}", out);
     } else {
         anyhow::bail!("File not found in vault: {}", src);
     }
@@ -191,19 +186,19 @@ pub fn do_get(src: String, out: PathBuf, vault: String) -> Result<()> {
 }
 
 pub fn do_repair(vault: String) -> Result<()> {
-    println!("🛠️  Starting repair process...");
+    println!("Starting repair process...");
 
     let (vault_path, key) = tokio::task::block_in_place(|| unlock_vault(&vault))?;
 
     match IndexManager::load(vault_path, &key) {
         Ok(mut index_mgr) => {
             println!(
-                "✅ Valid index replica found (Rev: {}).",
+                "Valid index replica found (Rev: {}).",
                 index_mgr.data.revision
             );
             println!("🔄 Resyncing all replicas...");
             index_mgr.save(&key)?;
-            println!("✅ Repair complete.");
+            println!("Repair complete.");
             Ok(())
         }
         Err(e) => {
@@ -213,12 +208,10 @@ pub fn do_repair(vault: String) -> Result<()> {
     }
 }
 
-// ... (existing functions) ...
-
 pub fn do_clean(vault: String, dry_run: bool) -> Result<()> {
-    println!("🧹 Starting Garbage Collection...");
+    println!("Starting Garbage Collection...");
     if dry_run {
-        println!("ℹ️  DRY RUN: No files will be deleted.");
+        println!("DRY RUN: No files will be deleted.");
     }
 
     // 1. Unlock and Load Index
@@ -226,7 +219,7 @@ pub fn do_clean(vault: String, dry_run: bool) -> Result<()> {
     let index_mgr = IndexManager::load(vault_path.clone(), &key)?;
 
     // 2. Build Set of Valid Blocks
-    println!("📊 Analyzing Index...");
+    println!("Analyzing Index...");
     let mut valid_blocks = HashSet::new();
     for entry in index_mgr.data.files.values() {
         for block in &entry.blocks {
@@ -243,8 +236,7 @@ pub fn do_clean(vault: String, dry_run: bool) -> Result<()> {
     let mut deleted_count: u64 = 0;
     let mut kept_count: u64 = 0;
 
-    // Assuming blocks are stored directly in vault_path or vault_path/store
-    // We scan the vault_path for blk_*.bin files
+
     let read_dir = fs::read_dir(&vault_path).context("Failed to read vault directory")?;
 
     for entry in read_dir {
@@ -280,7 +272,7 @@ pub fn do_clean(vault: String, dry_run: bool) -> Result<()> {
     }
 
     println!("---------------------------------------------------");
-    println!("✅ GC Complete.");
+    println!("GC Complete.");
     println!("   Active Blocks: {}", kept_count);
     println!("   Orphans Removed: {}", deleted_count);
     println!(

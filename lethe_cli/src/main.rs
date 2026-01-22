@@ -1,6 +1,12 @@
-// lethe_cli/src/main.rs
 mod cli;
-mod dav; 
+
+// Only compile the WebDAV module on Windows
+#[cfg(windows)]
+mod dav;
+
+// Only compile the FUSE module on Unix
+#[cfg(unix)]
+mod fs_fuse;
 
 use anyhow::Result;
 use clap::Parser;

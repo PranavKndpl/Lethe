@@ -1,6 +1,5 @@
-// lethe_cli/src/dav/fs.rs
 use std::io::Cursor;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{UNIX_EPOCH}; 
 use std::collections::HashSet;
 use dav_server::fs::{DavFileSystem, DavFile, DavDirEntry, DavMetaData, FsFuture, FsError, OpenOptions, ReadDirMeta};
 use dav_server::davpath::DavPath;
@@ -13,7 +12,7 @@ pub struct LetheWebDav {
 }
 
 impl DavFileSystem for LetheWebDav {
-    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<Box<dyn DavFile>> {
+    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
 
@@ -21,7 +20,6 @@ impl DavFileSystem for LetheWebDav {
             let index = state.index.lock().await;
             let mut data = Vec::new();
 
-            // 1. Try to find the file.
             if let Some(entry) = index.get_file(&path_str) {
                 if entry.is_dir { return Err(FsError::Forbidden); }
 
@@ -33,11 +31,9 @@ impl DavFileSystem for LetheWebDav {
                     }
                 }
             } else if !options.write {
-                // Read on non-existent file -> 404
                 return Err(FsError::NotFound);
             }
 
-            // THE FIX: If writing, assume dirty immediately (handles 0-byte files)
             let is_dirty = options.write;
 
             Ok(Box::new(LetheDavFile {
@@ -49,7 +45,7 @@ impl DavFileSystem for LetheWebDav {
         })
     }
 
-    fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: ReadDirMeta) -> FsFuture<dav_server::fs::FsStream<Box<dyn DavDirEntry>>> {
+    fn read_dir<'a>(&'a self, path: &'a DavPath, _meta: ReadDirMeta) -> FsFuture<'a, dav_server::fs::FsStream<Box<dyn DavDirEntry>>> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
 
@@ -92,7 +88,7 @@ impl DavFileSystem for LetheWebDav {
         })
     }
 
-    fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<Box<dyn DavMetaData>> {
+    fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
 
@@ -125,7 +121,7 @@ impl DavFileSystem for LetheWebDav {
         })
     }
 
-    fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+    fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
         Box::pin(async move {
@@ -137,7 +133,7 @@ impl DavFileSystem for LetheWebDav {
         })
     }
 
-    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
         Box::pin(async move {
@@ -150,7 +146,7 @@ impl DavFileSystem for LetheWebDav {
         })
     }
 
-    fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<()> {
+    fn remove_file<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         let path_str = path.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
         Box::pin(async move {
@@ -162,7 +158,7 @@ impl DavFileSystem for LetheWebDav {
         })
     }
 
-    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<()> {
+    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
         let old_path = from.as_pathbuf().to_string_lossy().replace("\\", "/");
         let new_path = to.as_pathbuf().to_string_lossy().replace("\\", "/");
         let state = self.state.clone();
@@ -188,7 +184,6 @@ impl DavFileSystem for LetheWebDav {
     }
 }
 
-// Helper Struct
 pub struct LetheDavEntry { pub name: String, pub meta: LetheMetaData }
 impl DavDirEntry for LetheDavEntry {
     fn name(&self) -> Vec<u8> { self.name.as_bytes().to_vec() }

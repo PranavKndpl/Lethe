@@ -1,4 +1,3 @@
-// lethe_cli/src/dav/mod.rs
 pub mod fs;
 pub mod file;
 pub mod state;

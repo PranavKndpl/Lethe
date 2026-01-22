@@ -1,0 +1,57 @@
+name: Release Build
+
+on:
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --- WINDOWS BUILD ---
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Rename
+        run: mv target/release/lethe_cli.exe lethe_windows.exe
+      - name: Upload
+        uses: softprops/action-gh-release@v1
+        with:
+          files: lethe_windows.exe
+
+  # --- LINUX BUILD ---
+  build-linux:
+    runs-on: ubuntu-20.04 # Use older Ubuntu for better compatibility
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse-dev pkg-config
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Rename
+        run: mv target/release/lethe_cli lethe_linux
+      - name: Upload
+        uses: softprops/action-gh-release@v1
+        with:
+          files: lethe_linux
+
+  # --- MAC BUILD (The Magic Step) ---
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: brew install macfuse
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Rename
+        run: mv target/release/lethe_cli lethe_macos
+      - name: Upload
+        uses: softprops/action-gh-release@v1
+        with:
+          files: lethe_macos

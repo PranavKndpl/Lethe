@@ -23,8 +23,8 @@ pub struct FileEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VaultIndex {
     pub version: u8,
-    pub revision: u64,      // Increments on every save (for conflict resolution)
-    pub salt: String,       // The salt used for the MasterKey
+    pub revision: u64,      
+    pub salt: String,       
     pub files: HashMap<String, FileEntry>, // Path -> File Info
 }
 
@@ -65,7 +65,6 @@ impl IndexManager {
     pub fn load(path: PathBuf, key: &MasterKey) -> Result<Self> {
         let mut candidates = Vec::new();
 
-        // Try to load all 3 replicas
         for i in 0..3 {
             let file_path = path.join(format!("meta_{}.bin", i));
             if file_path.exists() {
@@ -79,10 +78,8 @@ impl IndexManager {
             return Err(anyhow::anyhow!("No valid index found. Vault corrupted or wrong password."));
         }
 
-        // Sort by revision (highest first)
         candidates.sort_by(|a, b| b.revision.cmp(&a.revision));
-        
-        // Pick the winner
+
         let best_index = candidates.remove(0);
         
         Ok(Self {
@@ -95,26 +92,21 @@ impl IndexManager {
     pub fn save(&mut self, key: &MasterKey) -> Result<()> {
         self.data.revision += 1; // Increment revision
 
-        // Serialize to CBOR
         let plain_data = serde_cbor::to_vec(&self.data)
             .context("Failed to serialize index")?;
 
-        // Encrypt
         let (encrypted_data, nonce) = CryptoEngine::encrypt(&plain_data, key)?;
 
-        // Write to all 3 replicas
         for i in 0..3 {
             let file_name = format!("meta_{}.bin", i);
             let tmp_name = format!("meta_{}.tmp", i);
             let target_path = self.root_path.join(&file_name);
             let tmp_path = self.root_path.join(&tmp_name);
 
-            // 1. Write to .tmp first (Atomic write pattern)
             let mut file = File::create(&tmp_path)?;
             file.write_all(&nonce)?;
             file.write_all(&encrypted_data)?;
             
-            // 2. Rename .tmp to .bin (Atomic replace)
             fs::rename(&tmp_path, &target_path)?;
         }
 

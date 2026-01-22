@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyWrite, ReplyCreate, ReplyEmpty, Request, TimeOrNow,
@@ -5,22 +7,15 @@ use fuser::{
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use std::collections::{HashMap, HashSet};
+
+use libc::{ENOENT, ENOTEMPTY};
+
 use lethe_core::index::IndexManager;
 use lethe_core::storage::BlockManager;
 use lethe_core::crypto::MasterKey;
 
-// --- CROSS PLATFORM ERROR CODES ---
-#[cfg(unix)]
-use libc::{ENOENT, EACCES, ENOTEMPTY};
-
-#[cfg(windows)]
-const ENOENT: i32 = 2;
-#[cfg(windows)]
-const EACCES: i32 = 13;
-#[cfg(windows)]
-const ENOTEMPTY: i32 = 39; 
-
 const TTL: Duration = Duration::from_secs(1);
+
 
 pub struct LetheFS {
     pub index: IndexManager,
@@ -31,8 +26,7 @@ pub struct LetheFS {
 }
 
 impl LetheFS {
-    // --- HELPER 1: Resolve Path Logic ---
-    // Turns (parent_ino, "filename") -> "/path/to/filename"
+
     fn resolve_path(&self, parent_ino: u64, name: &OsStr) -> Option<String> {
         let parent_path = self.inode_map.get(&parent_ino)?;
         let name_str = name.to_string_lossy();
@@ -44,7 +38,6 @@ impl LetheFS {
         })
     }
 
-    // --- HELPER 2: Generate File Attributes ---
     fn get_file_attr(&self, path: &str, ino: u64) -> FileAttr {
         // 1. Root Directory
         if path == "/" {
