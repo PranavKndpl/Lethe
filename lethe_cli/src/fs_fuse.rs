@@ -147,31 +147,32 @@ impl Filesystem for LetheFS {
         ];
         let mut seen = HashSet::new();
 
-        for (child_ino, child_path) in &self.inode_map {
-            let is_child = if dir_path == "/" {
-                child_path.starts_with('/') && child_path.matches('/').count() == 1
-            } else {
-                child_path.starts_with(&dir_path) && 
-                child_path.len() > dir_path.len() &&
-                child_path.chars().nth(dir_path.len()) == Some('/') && 
-                child_path[dir_path.len()+1..].matches('/').count() == 0 
-            };
+        for full_path in self.index.data.files.keys() {
+            if let Some(rest) = full_path.strip_prefix(&dir_path) {
+                let clean_rest = rest.trim_start_matches('/');
+                
+                if clean_rest.is_empty() { continue; }
 
-            if is_child {
-                let name = if dir_path == "/" {
-                    child_path.trim_start_matches('/').to_string()
-                } else {
-                    child_path.strip_prefix(&format!("{}/", dir_path)).unwrap_or("").to_string()
-                };
-
-                if !name.is_empty() && !seen.contains(&name) {
-                    seen.insert(name.clone());
-                    let kind = if self.index.data.files.contains_key(child_path) {
-                        FileType::RegularFile
+                let name = clean_rest.split('/').next().unwrap_or("");
+                
+                if !name.is_empty() && !seen.contains(name) {
+                    
+                    let child_full_path = if dir_path == "/" {
+                        format!("/{}", name)
                     } else {
-                        FileType::Directory
+                        format!("{}/{}", dir_path, name)
                     };
-                    entries.push((*child_ino, kind, name));
+
+                    if full_path.starts_with(&child_full_path) {
+                        seen.insert(name.to_string());
+                        
+                        let is_file = self.index.get_file(&child_full_path).map(|e| !e.is_dir).unwrap_or(false);
+                        let kind = if is_file { FileType::RegularFile } else { FileType::Directory };
+                        
+                        let child_ino = fxhash::hash64(&child_full_path);
+                        
+                        entries.push((child_ino, kind, name.to_string()));
+                    }
                 }
             }
         }
