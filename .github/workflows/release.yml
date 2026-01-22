@@ -4,6 +4,9 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,9 +25,9 @@ jobs:
         with:
           files: lethe_windows.exe
 
-  # --- LINUX BUILD ---
+  # --- LINUX BUILD (UPDATED) ---
   build-linux:
-    runs-on: ubuntu-20.04 # Use older Ubuntu for better compatibility
+    runs-on: ubuntu-latest  
     steps:
       - uses: actions/checkout@v3
       - name: Install Dependencies
@@ -40,7 +43,7 @@ jobs:
         with:
           files: lethe_linux
 
-  # --- MAC BUILD (The Magic Step) ---
+  # --- MAC BUILD ---
   build-macos:
     runs-on: macos-latest
     steps:

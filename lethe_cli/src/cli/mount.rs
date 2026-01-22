@@ -136,9 +136,6 @@ pub async fn do_mount(vault: Option<String>, mountpoint: Option<String>) -> Resu
     Ok(())
 }
 
-// =========================================================
-//  THE MISSING FUNCTION 
-// =========================================================
 pub fn do_panic() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
